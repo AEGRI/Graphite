@@ -1,0 +1,4 @@
+Graphite is a language model.
+Graphite learns from text.
+This is a tokenizer test.
+The model will eventually generate text.
