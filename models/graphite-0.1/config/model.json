@@ -1,0 +1,23 @@
+{
+  "model": {
+    "name": "graphite",
+    "version": "0.1"
+  },
+  "architecture": {
+    "type": "decoder_transformer",
+    "vocab_size": 32000,
+    "context_length": 2048,
+    "hidden_size": 512,
+    "num_layers": 8,
+    "num_attention_heads": 8,
+    "intermediate_size": 2048,
+    "activation": "silu",
+    "normalization": "rmsnorm",
+    "normalization_epsilon": 1e-5,
+    "position_encoding": "rope"
+  },
+  "initialization": {
+    "method": "normal",
+    "std": 0.02
+  }
+}
