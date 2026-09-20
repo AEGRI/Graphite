@@ -12,14 +12,58 @@ DEFAULT_SPECIAL_TOKENS = {
 }
 
 
-BYTE_TOKEN_START = 256
 BYTE_VOCAB_SIZE = 256
+
+# A pair must occur at least this many times before it can become
+# a learned BPE merge. This prevents tiny datasets from collapsing
+# into giant one-off tokens.
+MIN_PAIR_FREQUENCY = 2
+
+
+SUPPORTED_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".json",
+    ".jsonl",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".lua",
+    ".luau",
+    ".cpp",
+    ".cc",
+    ".cxx",
+    ".c",
+    ".h",
+    ".hpp",
+    ".cs",
+    ".java",
+    ".rs",
+    ".go",
+    ".html",
+    ".css",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".cmake",
+    ".sh",
+    ".ps1",
+}
+
+
+def byte_token(value: int) -> str:
+    """Convert a byte value into a tokenizer symbol."""
+
+    return f"<byte:{value}>"
 
 
 def load_corpus(
     data_directory: str | Path,
 ) -> str:
-    """Load supported text files into one training corpus."""
+    """Load all supported files into one training corpus."""
 
     data_directory = Path(data_directory)
 
@@ -31,44 +75,13 @@ def load_corpus(
 
     texts = []
 
-    supported_extensions = {
-        ".txt",
-        ".md",
-        ".json",
-        ".jsonl",
-        ".py",
-        ".js",
-        ".ts",
-        ".tsx",
-        ".jsx",
-        ".lua",
-        ".luau",
-        ".cpp",
-        ".cc",
-        ".cxx",
-        ".c",
-        ".h",
-        ".hpp",
-        ".cs",
-        ".java",
-        ".rs",
-        ".go",
-        ".html",
-        ".css",
-        ".xml",
-        ".yaml",
-        ".yml",
-        ".toml",
-        ".cmake",
-        ".sh",
-        ".ps1",
-    }
-
-    for path in sorted(data_directory.rglob("*")):
+    for path in sorted(
+        data_directory.rglob("*")
+    ):
         if not path.is_file():
             continue
 
-        if path.suffix.lower() not in supported_extensions:
+        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
 
         try:
@@ -91,27 +104,29 @@ def load_corpus(
     return "\n\n".join(texts)
 
 
-def byte_token(value: int) -> str:
-    """Return the vocabulary representation of a byte."""
-
-    return f"<byte:{value}>"
-
-
 def build_initial_vocabulary(
     special_tokens: dict[str, int],
 ) -> dict[str, int]:
-    """Create the mandatory special-token and byte vocabulary."""
+    """
+    Build the initial vocabulary.
+
+    Special tokens are followed by all 256 possible byte tokens.
+    """
 
     vocabulary = dict(special_tokens)
 
-    used_ids = set(vocabulary.values())
+    used_ids = set(
+        vocabulary.values()
+    )
 
     next_id = max(
         used_ids,
         default=-1,
     ) + 1
 
-    for value in range(BYTE_VOCAB_SIZE):
+    for value in range(
+        BYTE_VOCAB_SIZE
+    ):
         token = byte_token(value)
 
         if token in vocabulary:
@@ -128,121 +143,93 @@ def build_initial_vocabulary(
     return vocabulary
 
 
-def encode_words(
+def encode_corpus(
     corpus: str,
-) -> dict[str, list[str]]:
+) -> list[str]:
     """
-    Convert whitespace-delimited corpus segments into byte symbols.
+    Convert the complete corpus into UTF-8 byte symbols.
 
-    Whitespace is intentionally preserved because it is meaningful
-    training data. Each whitespace-delimited segment is independently
-    represented as UTF-8 byte symbols.
+    Spaces, newlines, indentation, punctuation, and other formatting
+    remain part of the training sequence.
     """
 
-    words = corpus.split()
-
-    return {
-        word: [
-            byte_token(value)
-            for value in word.encode("utf-8")
-        ]
-        for word in words
-    }
-
-
-def build_word_frequency(
-    corpus: str,
-) -> Counter[str]:
-    """Count repeated whitespace-delimited corpus segments."""
-
-    return Counter(
-        corpus.split()
+    encoded = corpus.encode(
+        "utf-8"
     )
+
+    return [
+        byte_token(value)
+        for value in encoded
+    ]
 
 
 def count_pairs(
-    word_symbols: dict[str, list[str]],
-    word_frequency: Counter[str],
+    symbols: list[str],
 ) -> Counter[tuple[str, str]]:
-    """Count adjacent BPE symbol pairs weighted by frequency."""
+    """Count adjacent symbol pairs across the corpus."""
 
     pair_counts = Counter()
 
-    for word, symbols in word_symbols.items():
-        frequency = word_frequency[word]
+    for index in range(
+        len(symbols) - 1
+    ):
+        pair = (
+            symbols[index],
+            symbols[index + 1],
+        )
 
-        for index in range(
-            len(symbols) - 1
-        ):
-            pair = (
-                symbols[index],
-                symbols[index + 1],
-            )
-
-            pair_counts[pair] += frequency
+        pair_counts[pair] += 1
 
     return pair_counts
 
 
 def merge_pair(
-    word_symbols: dict[str, list[str]],
+    symbols: list[str],
     pair: tuple[str, str],
-) -> None:
-    """Apply one BPE merge to every affected word."""
+) -> list[str]:
+    """Merge every occurrence of a pair in the corpus."""
 
     left, right = pair
     merged_symbol = left + right
 
-    for word, symbols in word_symbols.items():
-        merged = []
-        index = 0
+    merged = []
+    index = 0
 
-        while index < len(symbols):
-            if (
-                index < len(symbols) - 1
-                and symbols[index] == left
-                and symbols[index + 1] == right
-            ):
-                merged.append(
-                    merged_symbol
-                )
+    while index < len(symbols):
+        if (
+            index < len(symbols) - 1
+            and symbols[index] == left
+            and symbols[index + 1] == right
+        ):
+            merged.append(
+                merged_symbol
+            )
 
-                index += 2
+            index += 2
 
-            else:
-                merged.append(
-                    symbols[index]
-                )
+        else:
+            merged.append(
+                symbols[index]
+            )
 
-                index += 1
+            index += 1
 
-        word_symbols[word] = merged
+    return merged
 
 
 def train_bpe(
     corpus: str,
     vocab_size: int,
     special_tokens: dict[str, int] | None = None,
+    min_pair_frequency: int = MIN_PAIR_FREQUENCY,
 ) -> GraphiteTokenizer:
     """
-    Train a byte-level BPE tokenizer.
+    Train a byte-level BPE tokenizer over the complete corpus.
 
-    The tokenizer always starts with:
-        - special tokens
-        - all 256 possible byte values
-
-    Additional vocabulary entries are learned through BPE merges.
+    Pairs that occur fewer than min_pair_frequency times are not
+    merged. This prevents tiny datasets from creating giant tokens
+    that merely memorize unique sections of the corpus.
     """
-
-    if vocab_size < (
-        len(DEFAULT_SPECIAL_TOKENS)
-        + BYTE_VOCAB_SIZE
-    ):
-        raise ValueError(
-            "vocab_size must be at least "
-            f"{len(DEFAULT_SPECIAL_TOKENS) + BYTE_VOCAB_SIZE} "
-            "for byte-level BPE."
-        )
 
     special_tokens = (
         special_tokens.copy()
@@ -250,38 +237,58 @@ def train_bpe(
         else DEFAULT_SPECIAL_TOKENS.copy()
     )
 
+    if min_pair_frequency < 1:
+        raise ValueError(
+            "min_pair_frequency must be at least 1."
+        )
+
+    minimum_vocab_size = (
+        len(special_tokens)
+        + BYTE_VOCAB_SIZE
+    )
+
+    if vocab_size < minimum_vocab_size:
+        raise ValueError(
+            "vocab_size must be at least "
+            f"{minimum_vocab_size} for byte-level BPE."
+        )
+
     vocabulary = build_initial_vocabulary(
         special_tokens
     )
 
-    word_frequency = build_word_frequency(
+    symbols = encode_corpus(
         corpus
     )
 
-    if not word_frequency:
+    if not symbols:
         raise ValueError(
-            "Corpus contains no usable text."
+            "Corpus contains no usable UTF-8 data."
         )
-
-    word_symbols = encode_words(
-        corpus
-    )
 
     merges: list[tuple[str, str]] = []
 
     while len(vocabulary) < vocab_size:
         pair_counts = count_pairs(
-            word_symbols,
-            word_frequency,
+            symbols
         )
 
         if not pair_counts:
             break
 
+        eligible_pairs = {
+            pair: count
+            for pair, count in pair_counts.items()
+            if count >= min_pair_frequency
+        }
+
+        if not eligible_pairs:
+            break
+
         best_pair = max(
-            pair_counts,
+            eligible_pairs,
             key=lambda pair: (
-                pair_counts[pair],
+                eligible_pairs[pair],
                 pair,
             ),
         )
@@ -292,8 +299,8 @@ def train_bpe(
         )
 
         if merged_symbol in vocabulary:
-            merge_pair(
-                word_symbols,
+            symbols = merge_pair(
+                symbols,
                 best_pair,
             )
 
@@ -307,9 +314,9 @@ def train_bpe(
             best_pair
         )
 
-        merge_pair(
-            word_symbols,
-            best_pair,
+        symbols = merge_pair(
+            symbols,
+            best_pair
         )
 
     return GraphiteTokenizer(
@@ -323,6 +330,7 @@ def train_tokenizer(
     data_directory: str | Path,
     output_path: str | Path,
     vocab_size: int = 32000,
+    min_pair_frequency: int = MIN_PAIR_FREQUENCY,
 ) -> GraphiteTokenizer:
     """Train and save the Graphite tokenizer."""
 
@@ -330,9 +338,25 @@ def train_tokenizer(
         data_directory
     )
 
+    print(
+        f"Corpus characters: "
+        f"{len(corpus):,}"
+    )
+
+    print(
+        f"Corpus bytes: "
+        f"{len(corpus.encode('utf-8')):,}"
+    )
+
+    print(
+        f"Minimum pair frequency: "
+        f"{min_pair_frequency}"
+    )
+
     tokenizer = train_bpe(
         corpus=corpus,
         vocab_size=vocab_size,
+        min_pair_frequency=min_pair_frequency,
     )
 
     tokenizer.save(
@@ -343,7 +367,9 @@ def train_tokenizer(
 
 
 def main() -> None:
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = (
+        Path(__file__).resolve().parents[1]
+    )
 
     data_directory = (
         project_root
@@ -362,6 +388,7 @@ def main() -> None:
         data_directory=data_directory,
         output_path=output_path,
         vocab_size=32000,
+        min_pair_frequency=MIN_PAIR_FREQUENCY,
     )
 
     print(

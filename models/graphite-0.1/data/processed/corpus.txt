@@ -1,4 +1,9 @@
 Graphite is a language model.
 Graphite learns from text.
-This is a tokenizer test.
+This is a tokenizer and training test.
 The model will eventually generate text.
+We are testing the complete training pipeline.
+Graphite should learn to predict the next token.
+The training system should calculate loss.
+The optimizer should update the model weights.
+The checkpoint system should save the trained model.

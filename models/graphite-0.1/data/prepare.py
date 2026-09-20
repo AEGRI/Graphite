@@ -8,6 +8,7 @@ MODEL_ROOT = Path(__file__).resolve().parents[1]
 if str(MODEL_ROOT) not in sys.path:
     sys.path.insert(0, str(MODEL_ROOT))
 
+
 from tokenizer.tokenizer import GraphiteTokenizer
 
 
@@ -16,36 +17,65 @@ SUPPORTED_EXTENSIONS = {
     ".md",
     ".json",
     ".jsonl",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".lua",
+    ".luau",
+    ".cpp",
+    ".cc",
+    ".cxx",
+    ".c",
+    ".h",
+    ".hpp",
+    ".cs",
+    ".java",
+    ".rs",
+    ".go",
+    ".html",
+    ".css",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".cmake",
+    ".sh",
+    ".ps1",
 }
 
 
 def discover_files(
     data_directory: str | Path,
 ) -> list[Path]:
-    """
-    Find supported dataset files recursively.
-    """
+    """Find all supported dataset files."""
 
-    data_directory = Path(data_directory)
+    data_directory = Path(
+        data_directory
+    )
 
     if not data_directory.exists():
         raise FileNotFoundError(
-            f"Data directory does not exist: {data_directory}"
+            f"Dataset directory does not exist: "
+            f"{data_directory}"
         )
 
     return sorted(
         path
         for path in data_directory.rglob("*")
-        if path.is_file()
-        and path.suffix.lower()
-        in SUPPORTED_EXTENSIONS
+        if (
+            path.is_file()
+            and path.suffix.lower()
+            in SUPPORTED_EXTENSIONS
+        )
     )
 
 
-def load_file(path: Path) -> str:
-    """
-    Load a supported dataset file.
-    """
+def load_file(
+    path: Path,
+) -> str:
+    """Read a dataset file as UTF-8."""
 
     return path.read_text(
         encoding="utf-8",
@@ -53,9 +83,12 @@ def load_file(path: Path) -> str:
     )
 
 
-def normalize_text(text: str) -> str:
+def normalize_text(
+    text: str,
+) -> str:
     """
-    Normalize raw text into a consistent representation.
+    Normalize line endings without destroying meaningful
+    whitespace or indentation.
     """
 
     text = text.replace(
@@ -68,13 +101,6 @@ def normalize_text(text: str) -> str:
         "\n",
     )
 
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-    ]
-
-    text = "\n".join(lines)
-
     return text.strip()
 
 
@@ -83,7 +109,10 @@ def extract_json_text(
     text: str,
 ) -> str:
     """
-    Extract readable strings from JSON or JSONL.
+    Extract string values from JSON or JSONL files.
+
+    This allows structured metadata files to contribute their
+    textual content without training directly on JSON syntax.
     """
 
     try:
@@ -93,6 +122,7 @@ def extract_json_text(
                 for line in text.splitlines()
                 if line.strip()
             ]
+
         else:
             values = [
                 json.loads(text)
@@ -101,36 +131,47 @@ def extract_json_text(
     except json.JSONDecodeError:
         return text
 
-    strings: list[str] = []
+    strings = []
 
     def collect_strings(
         value: object,
     ) -> None:
-        if isinstance(value, str):
+        if isinstance(
+            value,
+            str,
+        ):
             strings.append(value)
 
-        elif isinstance(value, dict):
+        elif isinstance(
+            value,
+            dict,
+        ):
             for child in value.values():
                 collect_strings(child)
 
-        elif isinstance(value, list):
+        elif isinstance(
+            value,
+            list,
+        ):
             for child in value:
                 collect_strings(child)
 
     for value in values:
         collect_strings(value)
 
-    return "\n".join(strings)
+    return "\n".join(
+        strings
+    )
 
 
 def process_file(
     path: Path,
 ) -> str:
-    """
-    Load and normalize one dataset file.
-    """
+    """Load and normalize one dataset file."""
 
-    text = load_file(path)
+    text = load_file(
+        path
+    )
 
     if path.suffix.lower() in {
         ".json",
@@ -141,23 +182,23 @@ def process_file(
             text,
         )
 
-    return normalize_text(text)
+    return normalize_text(
+        text
+    )
 
 
-def prepare_corpus(
+def prepare_documents(
     input_directory: str | Path,
-    output_path: str | Path,
-) -> dict[str, int]:
+) -> tuple[list[str], dict[str, int]]:
     """
-    Process dataset files into one training corpus.
+    Process every source document independently.
+
+    Keeping documents separate allows us to insert EOS boundaries
+    between documents during tokenization.
     """
 
     input_directory = Path(
         input_directory
-    )
-
-    output_path = Path(
-        output_path
     )
 
     files = discover_files(
@@ -166,18 +207,20 @@ def prepare_corpus(
 
     if not files:
         raise ValueError(
-            f"No supported dataset files found "
-            f"in {input_directory}"
+            f"No supported files found in: "
+            f"{input_directory}"
         )
 
-    processed_documents: list[str] = []
+    documents = []
 
     processed_files = 0
     skipped_files = 0
 
     for path in files:
         try:
-            text = process_file(path)
+            text = process_file(
+                path
+            )
 
         except OSError:
             skipped_files += 1
@@ -187,17 +230,46 @@ def prepare_corpus(
             skipped_files += 1
             continue
 
-        processed_documents.append(text)
-        processed_files += 1
-
-    if not processed_documents:
-        raise ValueError(
-            "No usable text was produced "
-            "from the dataset."
+        documents.append(
+            text
         )
 
-    corpus = "\n\n".join(
-        processed_documents
+        processed_files += 1
+
+    if not documents:
+        raise ValueError(
+            "No usable documents were produced."
+        )
+
+    total_characters = sum(
+        len(document)
+        for document in documents
+    )
+
+    stats = {
+        "files_discovered": len(files),
+        "files_processed": processed_files,
+        "files_skipped": skipped_files,
+        "documents": len(documents),
+        "characters": total_characters,
+    }
+
+    return documents, stats
+
+
+def write_corpus(
+    documents: list[str],
+    output_path: str | Path,
+) -> None:
+    """
+    Write the processed corpus while keeping document boundaries.
+
+    Two newlines separate documents. Individual document contents
+    retain their internal whitespace.
+    """
+
+    output_path = Path(
+        output_path
     )
 
     output_path.parent.mkdir(
@@ -205,63 +277,67 @@ def prepare_corpus(
         exist_ok=True,
     )
 
+    corpus = "\n\n".join(
+        documents
+    )
+
     output_path.write_text(
         corpus,
         encoding="utf-8",
     )
 
-    return {
-        "files_discovered": len(files),
-        "files_processed": processed_files,
-        "files_skipped": skipped_files,
-        "characters": len(corpus),
-    }
+
+def tokenize_documents(
+    documents: list[str],
+    tokenizer: GraphiteTokenizer,
+) -> list[int]:
+    """
+    Tokenize documents independently and place EOS boundaries
+    between them.
+
+    BOS/EOS are not automatically added by the tokenizer here
+    because document boundaries need explicit control.
+    """
+
+    token_ids = []
+
+    bos_id = tokenizer.special_tokens.get(
+        "<bos>"
+    )
+
+    eos_id = tokenizer.special_tokens.get(
+        "<eos>"
+    )
+
+    for document in documents:
+        if bos_id is not None:
+            token_ids.append(
+                bos_id
+            )
+
+        token_ids.extend(
+            tokenizer.encode(
+                document,
+                add_special_tokens=False,
+            )
+        )
+
+        if eos_id is not None:
+            token_ids.append(
+                eos_id
+            )
+
+    return token_ids
 
 
-def tokenize_corpus(
-    corpus_path: str | Path,
-    tokenizer_path: str | Path,
+def write_tokens(
+    token_ids: list[int],
     output_path: str | Path,
-) -> dict[str, int]:
-    """
-    Convert the prepared corpus into token IDs.
-    """
-
-    corpus_path = Path(
-        corpus_path
-    )
-
-    tokenizer_path = Path(
-        tokenizer_path
-    )
+) -> None:
+    """Write token IDs as one integer per line."""
 
     output_path = Path(
         output_path
-    )
-
-    if not corpus_path.exists():
-        raise FileNotFoundError(
-            f"Prepared corpus does not exist: "
-            f"{corpus_path}"
-        )
-
-    if not tokenizer_path.exists():
-        raise FileNotFoundError(
-            f"Tokenizer does not exist: "
-            f"{tokenizer_path}"
-        )
-
-    tokenizer = GraphiteTokenizer.load(
-        tokenizer_path
-    )
-
-    corpus = corpus_path.read_text(
-        encoding="utf-8"
-    )
-
-    token_ids = tokenizer.encode(
-        corpus,
-        add_special_tokens=True,
     )
 
     output_path.parent.mkdir(
@@ -277,17 +353,58 @@ def tokenize_corpus(
         encoding="utf-8",
     )
 
-    return {
-        "tokens": len(token_ids),
-        "vocabulary_size": tokenizer.vocab_size,
-    }
+
+def prepare_corpus(
+    input_directory: str | Path,
+    corpus_output_path: str | Path,
+    tokens_output_path: str | Path,
+    tokenizer_path: str | Path,
+) -> dict[str, int]:
+    """
+    Run the complete preprocessing pipeline.
+
+    Returns statistics for both document processing and tokenization.
+    """
+
+    documents, stats = prepare_documents(
+        input_directory
+    )
+
+    write_corpus(
+        documents,
+        corpus_output_path,
+    )
+
+    tokenizer = GraphiteTokenizer.load(
+        tokenizer_path
+    )
+
+    token_ids = tokenize_documents(
+        documents,
+        tokenizer,
+    )
+
+    if not token_ids:
+        raise ValueError(
+            "Tokenizer produced no tokens."
+        )
+
+    write_tokens(
+        token_ids,
+        tokens_output_path,
+    )
+
+    stats.update(
+        {
+            "tokens": len(token_ids),
+            "vocabulary_size": tokenizer.vocab_size,
+        }
+    )
+
+    return stats
 
 
 def main() -> None:
-    """
-    Prepare and tokenize the Graphite dataset.
-    """
-
     project_root = (
         Path(__file__).resolve().parents[1]
     )
@@ -309,6 +426,11 @@ def main() -> None:
         / "corpus.txt"
     )
 
+    tokens_path = (
+        processed_directory
+        / "tokens.txt"
+    )
+
     tokenizer_path = (
         project_root
         / "tokenizer"
@@ -316,29 +438,46 @@ def main() -> None:
         / "tokenizer.json"
     )
 
-    tokens_path = (
-        processed_directory
-        / "tokens.txt"
-    )
-
-    corpus_stats = prepare_corpus(
+    stats = prepare_corpus(
         input_directory=dataset_directory,
-        output_path=corpus_path,
+        corpus_output_path=corpus_path,
+        tokens_output_path=tokens_path,
+        tokenizer_path=tokenizer_path,
     )
 
     print(
         f"Files discovered: "
-        f"{corpus_stats['files_discovered']}"
+        f"{stats['files_discovered']}"
     )
 
     print(
         f"Files processed: "
-        f"{corpus_stats['files_processed']}"
+        f"{stats['files_processed']}"
     )
 
     print(
         f"Files skipped: "
-        f"{corpus_stats['files_skipped']}"
+        f"{stats['files_skipped']}"
+    )
+
+    print(
+        f"Documents: "
+        f"{stats['documents']}"
+    )
+
+    print(
+        f"Characters: "
+        f"{stats['characters']:,}"
+    )
+
+    print(
+        f"Tokens: "
+        f"{stats['tokens']:,}"
+    )
+
+    print(
+        f"Vocabulary size: "
+        f"{stats['vocabulary_size']:,}"
     )
 
     print(
@@ -346,24 +485,8 @@ def main() -> None:
         f"{corpus_path}"
     )
 
-    token_stats = tokenize_corpus(
-        corpus_path=corpus_path,
-        tokenizer_path=tokenizer_path,
-        output_path=tokens_path,
-    )
-
     print(
-        f"Tokens generated: "
-        f"{token_stats['tokens']}"
-    )
-
-    print(
-        f"Vocabulary size: "
-        f"{token_stats['vocabulary_size']}"
-    )
-
-    print(
-        f"Token IDs written to: "
+        f"Tokens written to: "
         f"{tokens_path}"
     )
 
