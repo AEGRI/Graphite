@@ -1,11 +1,22 @@
+import argparse
 import json
+import math
 import random
 from pathlib import Path
+import sys
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+
+MODEL_ROOT = Path(__file__).resolve().parents[1]
+
+if str(MODEL_ROOT) not in sys.path:
+    sys.path.insert(0, str(MODEL_ROOT))
+
+
 from architecture.model import GraphiteModel
+from training.checkpoint import load_checkpoint
 from training.trainer import Trainer
 
 
@@ -30,13 +41,6 @@ def select_device() -> torch.device:
 
 
 class TextDataset(Dataset):
-    """
-    Minimal next-token prediction dataset.
-
-    Expects a sequence of token IDs and produces fixed-length
-    input/target pairs.
-    """
-
     def __init__(
         self,
         token_ids: list[int],
@@ -44,8 +48,7 @@ class TextDataset(Dataset):
     ):
         if len(token_ids) <= context_length:
             raise ValueError(
-                "Dataset must contain more tokens than "
-                "the context length."
+                "Dataset must contain more tokens than the context length."
             )
 
         self.token_ids = torch.tensor(
@@ -56,26 +59,43 @@ class TextDataset(Dataset):
         self.context_length = context_length
 
     def __len__(self) -> int:
-        return (
-            len(self.token_ids)
-            - self.context_length
-        )
+        return len(self.token_ids) - self.context_length
 
     def __getitem__(
         self,
         index: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_ids = self.token_ids[
-            index:
-            index + self.context_length
+            index:index + self.context_length
         ]
 
         targets = self.token_ids[
-            index + 1:
-            index + self.context_length + 1
+            index + 1:index + self.context_length + 1
         ]
 
         return input_ids, targets
+
+
+def load_token_ids(path: Path) -> list[int]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Token dataset does not exist: {path}"
+        )
+
+    token_ids = [
+        int(line.strip())
+        for line in path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+
+    if not token_ids:
+        raise ValueError(
+            f"Token dataset is empty: {path}"
+        )
+
+    return token_ids
 
 
 def build_scheduler(
@@ -105,11 +125,7 @@ def build_scheduler(
 
         cosine = 0.5 * (
             1.0
-            + torch.cos(
-                torch.tensor(
-                    progress * torch.pi
-                )
-            ).item()
+            + math.cos(progress * math.pi)
         )
 
         return (
@@ -127,40 +143,32 @@ def build_scheduler(
     )
 
 
-def load_token_ids(
-    path: Path,
-) -> list[int]:
-    """
-    Load a prepared token-ID dataset.
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train Graphite."
+    )
 
-    The file must contain one integer token ID per line.
-    """
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Override the configured maximum training steps.",
+    )
 
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Token dataset does not exist: {path}"
-        )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume training from a checkpoint.",
+    )
 
-    token_ids = [
-        int(line.strip())
-        for line in path.read_text(
-            encoding="utf-8"
-        ).splitlines()
-        if line.strip()
-    ]
-
-    if not token_ids:
-        raise ValueError(
-            f"Token dataset is empty: {path}"
-        )
-
-    return token_ids
+    return parser.parse_args()
 
 
 def main() -> None:
-    project_root = Path(
-        __file__
-    ).resolve().parents[1]
+    args = parse_args()
+
+    project_root = MODEL_ROOT
 
     config_directory = (
         project_root / "config"
@@ -200,6 +208,53 @@ def main() -> None:
 
     print(f"Device: {device}")
 
+    token_dataset_path = (
+        project_root
+        / "data"
+        / "processed"
+        / "tokens.txt"
+    )
+
+    token_ids = load_token_ids(
+        token_dataset_path
+    )
+
+    print(
+        f"Token count: {len(token_ids)}"
+    )
+
+    configured_context_length = (
+        architecture["context_length"]
+    )
+
+    context_length = min(
+        configured_context_length,
+        len(token_ids) - 1,
+    )
+
+    if context_length < 1:
+        raise ValueError(
+            "Not enough tokens for training."
+        )
+
+    dataset = TextDataset(
+        token_ids=token_ids,
+        context_length=context_length,
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=min(
+            training["batch_size"],
+            len(dataset),
+        ),
+        shuffle=True,
+        drop_last=False,
+        pin_memory=(
+            device.type == "cuda"
+        ),
+    )
+
     model = GraphiteModel(
         vocab_size=architecture[
             "vocab_size"
@@ -229,17 +284,39 @@ def main() -> None:
 
     model.to(device)
 
+    parameter_count = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+    )
+
+    print(
+        f"Parameters: {parameter_count:,}"
+    )
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=training["learning_rate"],
         betas=tuple(
             optimizer_config["betas"]
         ),
-        eps=optimizer_config["epsilon"],
+        eps=optimizer_config[
+            "epsilon"
+        ],
         weight_decay=training[
             "weight_decay"
         ],
     )
+
+    max_steps = (
+        args.max_steps
+        if args.max_steps is not None
+        else training["max_steps"]
+    )
+
+    if max_steps < 1:
+        raise ValueError(
+            "--max-steps must be at least 1."
+        )
 
     min_learning_rate = training[
         "min_learning_rate"
@@ -252,59 +329,60 @@ def main() -> None:
 
     scheduler = build_scheduler(
         optimizer=optimizer,
-        warmup_steps=scheduler_config[
-            "warmup_steps"
-        ],
-        max_steps=training[
-            "max_steps"
-        ],
+        warmup_steps=min(
+            scheduler_config[
+                "warmup_steps"
+            ],
+            max_steps,
+        ),
+        max_steps=max_steps,
         min_learning_rate_ratio=(
             min_learning_rate_ratio
         ),
     )
 
-    token_dataset_path = (
-        project_root
-        / "data"
-        / "processed"
-        / "tokens.txt"
-    )
+    start_step = 0
 
-    token_ids = load_token_ids(
-        token_dataset_path
-    )
+    if args.resume is not None:
+        checkpoint_path = Path(
+            args.resume
+        )
 
-    dataset = TextDataset(
-        token_ids=token_ids,
-        context_length=architecture[
-            "context_length"
-        ],
-    )
+        metadata = load_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            map_location=device,
+        )
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=training[
-            "batch_size"
-        ],
-        shuffle=True,
-        drop_last=True,
-        pin_memory=(
-            device.type == "cuda"
-        ),
-    )
+        start_step = metadata["step"]
 
-    run_id = (
-        f"run-{seed}"
-    )
+        print(
+            f"Resumed checkpoint: "
+            f"{checkpoint_path}"
+        )
+
+        print(
+            f"Resuming from step: "
+            f"{start_step}"
+        )
+
+        if start_step >= max_steps:
+            raise ValueError(
+                f"Checkpoint is already at step "
+                f"{start_step}, but max steps is "
+                f"{max_steps}."
+            )
+
+    run_id = f"run-{seed}"
 
     trainer = Trainer(
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
         device=device,
-        max_steps=training[
-            "max_steps"
-        ],
+        max_steps=max_steps,
         gradient_accumulation_steps=training[
             "gradient_accumulation_steps"
         ],
@@ -327,6 +405,7 @@ def main() -> None:
 
     trainer.train(
         dataloader=dataloader,
+        start_step=start_step,
     )
 
 

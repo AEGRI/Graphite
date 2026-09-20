@@ -1,4 +1,3 @@
-import math
 import time
 from typing import Callable
 
@@ -9,8 +8,7 @@ from .checkpoint import save_checkpoint
 
 
 class Trainer:
-    """
-    Training engine for Graphite.
+    """Training engine for Graphite.
 
     Handles forward passes, loss calculation, gradient accumulation,
     optimization, learning-rate scheduling, gradient clipping,
@@ -37,21 +35,17 @@ class Trainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
-
         self.max_steps = max_steps
         self.gradient_accumulation_steps = (
             gradient_accumulation_steps
         )
         self.gradient_clip_norm = gradient_clip_norm
-
         self.checkpoint_every = checkpoint_every
         self.checkpoint_directory = checkpoint_directory
         self.run_id = run_id
         self.log_every = log_every
-
         self.scaler = scaler
         self.logger = logger or print
-
         self.step = 0
 
     def _compute_loss(
@@ -59,9 +53,7 @@ class Trainer:
         input_ids: torch.Tensor,
         targets: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Calculate next-token prediction loss.
-        """
+        """Calculate next-token prediction loss."""
 
         logits = self.model(input_ids)
 
@@ -75,9 +67,7 @@ class Trainer:
         input_ids: torch.Tensor,
         targets: torch.Tensor,
     ) -> float:
-        """
-        Perform one gradient-accumulation micro-step.
-        """
+        """Perform one gradient-accumulation micro-step."""
 
         input_ids = input_ids.to(
             self.device,
@@ -125,9 +115,7 @@ class Trainer:
         return loss.detach().item()
 
     def _optimizer_step(self) -> None:
-        """
-        Apply accumulated gradients.
-        """
+        """Apply accumulated gradients."""
 
         if self.scaler is not None:
             self.scaler.unscale_(
@@ -165,13 +153,7 @@ class Trainer:
         dataloader,
         start_step: int = 0,
     ) -> None:
-        """
-        Train the model until max_steps is reached.
-
-        The dataloader must yield:
-
-            input_ids, targets
-        """
+        """Train the model until max_steps is reached."""
 
         self.step = start_step
 
@@ -195,10 +177,12 @@ class Trainer:
                     input_ids, targets = next(
                         data_iterator
                     )
+
                 except StopIteration:
                     data_iterator = iter(
                         dataloader
                     )
+
                     input_ids, targets = next(
                         data_iterator
                     )
@@ -251,28 +235,39 @@ class Trainer:
                 % self.checkpoint_every
                 == 0
             ):
-                checkpoint_path = (
-                    self._checkpoint_path()
-                )
+                self.save_checkpoint()
 
-                save_checkpoint(
-                    path=checkpoint_path,
-                    model=self.model,
-                    optimizer=self.optimizer,
-                    scheduler=self.scheduler,
-                    step=self.step,
-                    run_id=self.run_id,
-                    scaler=self.scaler,
-                )
+        # Always save the final state, even when the
+        # run ends before checkpoint_every is reached.
+        if (
+            self.max_steps > 0
+            and self.step % self.checkpoint_every != 0
+        ):
+            self.save_checkpoint()
 
-                self.logger(
-                    f"checkpoint={checkpoint_path}"
-                )
+    def save_checkpoint(self) -> str:
+        """Save the current training state."""
 
-    def _checkpoint_path(self):
-        """
-        Generate the checkpoint filename.
-        """
+        checkpoint_path = self._checkpoint_path()
+
+        save_checkpoint(
+            path=checkpoint_path,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            step=self.step,
+            run_id=self.run_id,
+            scaler=self.scaler,
+        )
+
+        self.logger(
+            f"checkpoint={checkpoint_path}"
+        )
+
+        return checkpoint_path
+
+    def _checkpoint_path(self) -> str:
+        """Generate the checkpoint filename."""
 
         return (
             f"{self.checkpoint_directory}/"

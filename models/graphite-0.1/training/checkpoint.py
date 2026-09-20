@@ -1,7 +1,11 @@
 from pathlib import Path
 from typing import Any
+import random
 
 import torch
+
+
+CHECKPOINT_VERSION = 2
 
 
 def save_checkpoint(
@@ -13,18 +17,17 @@ def save_checkpoint(
     run_id: str,
     scaler: Any | None = None,
 ) -> None:
-    """
-    Save a complete training checkpoint.
-    """
+    """Save a complete training checkpoint."""
 
     path = Path(path)
+
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     checkpoint = {
-        "version": 1,
+        "version": CHECKPOINT_VERSION,
         "run_id": run_id,
         "step": step,
         "model": model.state_dict(),
@@ -41,6 +44,7 @@ def save_checkpoint(
         ),
         "rng": {
             "torch": torch.get_rng_state(),
+            "python": random.getstate(),
         },
     }
 
@@ -63,11 +67,7 @@ def load_checkpoint(
     scaler: Any | None = None,
     map_location: str | torch.device = "cpu",
 ) -> dict[str, Any]:
-    """
-    Load a checkpoint and restore training state.
-
-    Returns metadata including the run ID and training step.
-    """
+    """Load a checkpoint and restore training state."""
 
     path = Path(path)
 
@@ -122,6 +122,11 @@ def load_checkpoint(
             rng["torch"]
         )
 
+    if "python" in rng:
+        random.setstate(
+            rng["python"]
+        )
+
     if (
         torch.cuda.is_available()
         and "cuda" in rng
@@ -131,7 +136,15 @@ def load_checkpoint(
         )
 
     return {
-        "version": checkpoint.get("version", 1),
-        "run_id": checkpoint.get("run_id"),
-        "step": checkpoint.get("step", 0),
+        "version": checkpoint.get(
+            "version",
+            1,
+        ),
+        "run_id": checkpoint.get(
+            "run_id"
+        ),
+        "step": checkpoint.get(
+            "step",
+            0,
+        ),
     }
