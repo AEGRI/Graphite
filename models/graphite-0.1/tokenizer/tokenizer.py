@@ -4,10 +4,15 @@ import json
 
 class GraphiteTokenizer:
     """
-    BPE tokenizer interface for Graphite 0.1.
+    Byte-level BPE tokenizer for Graphite.
 
-    Loads a trained tokenizer vocabulary and merges, then converts
-    text to token IDs and token IDs back into text.
+    Vocabulary IDs represent either:
+        - special tokens
+        - individual UTF-8 bytes
+        - learned BPE combinations of byte tokens
+
+    Because the tokenizer operates on bytes, arbitrary UTF-8 text can
+    be represented without relying on an unknown-token fallback.
     """
 
     def __init__(
@@ -32,57 +37,88 @@ class GraphiteTokenizer:
 
     @property
     def vocab_size(self) -> int:
+        """Return the total tokenizer vocabulary size."""
+
         return len(self.vocabulary)
 
-    def _apply_bpe(self, word: str) -> list[str]:
-        """
-        Apply learned BPE merges to a single word.
-        """
+    def _byte_token(
+        self,
+        value: int,
+    ) -> str:
+        """Convert a byte value into its vocabulary token."""
 
-        if not word:
-            return []
+        return f"<byte:{value}>"
 
-        symbols = list(word)
+    def _encode_bytes(
+        self,
+        text: str,
+    ) -> list[str]:
+        """Convert UTF-8 text into byte-level symbols."""
+
+        encoded = text.encode("utf-8")
+
+        return [
+            self._byte_token(value)
+            for value in encoded
+        ]
+
+    def _apply_bpe(
+        self,
+        symbols: list[str],
+    ) -> list[str]:
+        """Apply learned BPE merges to a symbol sequence."""
+
+        if len(symbols) <= 1:
+            return symbols
 
         while len(symbols) > 1:
-            pairs = [
-                (symbols[index], symbols[index + 1])
-                for index in range(len(symbols) - 1)
-            ]
+            best_pair = None
+            best_rank = None
 
-            available_pairs = [
-                pair
-                for pair in pairs
-                if pair in self.merge_ranks
-            ]
+            for index in range(len(symbols) - 1):
+                pair = (
+                    symbols[index],
+                    symbols[index + 1],
+                )
 
-            if not available_pairs:
+                rank = self.merge_ranks.get(pair)
+
+                if rank is None:
+                    continue
+
+                if (
+                    best_rank is None
+                    or rank < best_rank
+                ):
+                    best_pair = pair
+                    best_rank = rank
+
+            if best_pair is None:
                 break
 
-            best_pair = min(
-                available_pairs,
-                key=lambda pair: self.merge_ranks[pair],
-            )
+            left, right = best_pair
+            merged_symbol = left + right
 
-            merged: list[str] = []
+            merged = []
             index = 0
 
             while index < len(symbols):
                 if (
                     index < len(symbols) - 1
-                    and (
-                        symbols[index],
-                        symbols[index + 1],
-                    )
-                    == best_pair
+                    and symbols[index] == left
+                    and symbols[index + 1] == right
                 ):
                     merged.append(
-                        symbols[index]
-                        + symbols[index + 1]
+                        merged_symbol
                     )
+
                     index += 2
+
                 else:
-                    merged.append(symbols[index])
+                    merged.append(
+                        symbols[index]
+                    )
+
                     index += 1
 
             symbols = merged
@@ -95,43 +131,129 @@ class GraphiteTokenizer:
         add_special_tokens: bool = True,
     ) -> list[int]:
         """
-        Convert text into token IDs.
+        Encode UTF-8 text into token IDs.
         """
 
-        token_ids: list[int] = []
+        token_ids = []
 
         if add_special_tokens:
-            bos_id = self.special_tokens.get("<bos>")
+            bos_id = self.special_tokens.get(
+                "<bos>"
+            )
 
             if bos_id is not None:
                 token_ids.append(bos_id)
 
-        unknown_id = self.special_tokens.get("<unk>")
+        symbols = self._encode_bytes(text)
+        symbols = self._apply_bpe(symbols)
 
-        for word in text.split():
-            subwords = self._apply_bpe(word)
+        for symbol in symbols:
+            token_id = self.vocabulary.get(
+                symbol
+            )
 
-            for subword in subwords:
-                token_id = self.vocabulary.get(subword)
+            if token_id is None:
+                raise ValueError(
+                    "Tokenizer vocabulary is missing "
+                    f"token: {symbol!r}"
+                )
 
-                if token_id is None:
-                    if unknown_id is None:
-                        raise ValueError(
-                            f"Unknown token with no <unk> token: "
-                            f"{subword!r}"
-                        )
-
-                    token_id = unknown_id
-
-                token_ids.append(token_id)
+            token_ids.append(token_id)
 
         if add_special_tokens:
-            eos_id = self.special_tokens.get("<eos>")
+            eos_id = self.special_tokens.get(
+                "<eos>"
+            )
 
             if eos_id is not None:
                 token_ids.append(eos_id)
 
         return token_ids
+
+    def _split_merged_symbol(
+        self,
+        symbol: str,
+    ) -> list[str]:
+        """
+        Split a merged byte token back into its component
+        <byte:N> symbols.
+        """
+
+        symbols = []
+        index = 0
+
+        while index < len(symbol):
+            if not symbol.startswith(
+                "<byte:",
+                index,
+            ):
+                raise ValueError(
+                    "Invalid byte-level token "
+                    f"representation: {symbol!r}"
+                )
+
+            end = symbol.find(
+                ">",
+                index,
+            )
+
+            if end == -1:
+                raise ValueError(
+                    f"Malformed byte token: {symbol!r}"
+                )
+
+            value_text = symbol[
+                index + len("<byte:"):end
+            ]
+
+            try:
+                value = int(value_text)
+
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid byte value in token: "
+                    f"{symbol!r}"
+                ) from error
+
+            if not 0 <= value <= 255:
+                raise ValueError(
+                    f"Byte value out of range: "
+                    f"{value}"
+                )
+
+            symbols.append(
+                symbol[index:end + 1]
+            )
+
+            index = end + 1
+
+        return symbols
+
+    def _decode_symbol(
+        self,
+        symbol: str,
+    ) -> bytes:
+        """Convert a vocabulary symbol into raw bytes."""
+
+        byte_symbols = (
+            self._split_merged_symbol(
+                symbol
+            )
+        )
+
+        output = bytearray()
+
+        for byte_symbol in byte_symbols:
+            start = len("<byte:")
+            end = byte_symbol.find(">")
+
+            value = int(
+                byte_symbol[start:end]
+            )
+
+            output.append(value)
+
+        return bytes(output)
 
     def decode(
         self,
@@ -139,14 +261,14 @@ class GraphiteTokenizer:
         skip_special_tokens: bool = True,
     ) -> str:
         """
-        Convert token IDs back into text.
+        Decode token IDs back into UTF-8 text.
         """
 
         special_token_ids = set(
             self.special_tokens.values()
         )
 
-        tokens: list[str] = []
+        output = bytearray()
 
         for token_id in token_ids:
             if (
@@ -155,21 +277,35 @@ class GraphiteTokenizer:
             ):
                 continue
 
-            token = self.id_to_token.get(token_id)
+            token = self.id_to_token.get(
+                token_id
+            )
 
             if token is None:
                 raise ValueError(
                     f"Unknown token ID: {token_id}"
                 )
 
-            tokens.append(token)
+            output.extend(
+                self._decode_symbol(token)
+            )
 
-        return " ".join(tokens)
+        try:
+            return output.decode(
+                "utf-8"
+            )
 
-    def save(self, path: str | Path) -> None:
-        """
-        Save tokenizer vocabulary, merges, and special tokens.
-        """
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                "Decoded token sequence is not "
+                "valid UTF-8."
+            ) from error
+
+    def save(
+        self,
+        path: str | Path,
+    ) -> None:
+        """Save the tokenizer to disk."""
 
         path = Path(path)
 
@@ -179,6 +315,8 @@ class GraphiteTokenizer:
         )
 
         data = {
+            "version": 2,
+            "type": "byte_bpe",
             "vocabulary": self.vocabulary,
             "merges": [
                 list(pair)
@@ -201,15 +339,14 @@ class GraphiteTokenizer:
         cls,
         path: str | Path,
     ) -> "GraphiteTokenizer":
-        """
-        Load a trained tokenizer.
-        """
+        """Load a tokenizer from disk."""
 
         path = Path(path)
 
         if not path.exists():
             raise FileNotFoundError(
-                f"Tokenizer file does not exist: {path}"
+                f"Tokenizer file does not exist: "
+                f"{path}"
             )
 
         data = json.loads(
@@ -217,6 +354,12 @@ class GraphiteTokenizer:
                 encoding="utf-8"
             )
         )
+
+        if data.get("type") != "byte_bpe":
+            raise ValueError(
+                "Unsupported tokenizer type: "
+                f"{data.get('type')!r}"
+            )
 
         merges = [
             tuple(pair)

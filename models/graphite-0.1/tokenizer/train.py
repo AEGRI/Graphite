@@ -1,385 +1,382 @@
-import json
-import math
-import random
+from collections import Counter
 from pathlib import Path
-import sys
 
-import torch
-from torch.utils.data import DataLoader, Dataset
+from .tokenizer import GraphiteTokenizer
 
 
-MODEL_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(MODEL_ROOT))
-
-from architecture.model import GraphiteModel
-from training.trainer import Trainer
-
-
-def load_json(path: Path) -> dict:
-    """
-    Load a JSON file.
-    """
-
-    with path.open(
-        "r",
-        encoding="utf-8",
-    ) as file:
-        return json.load(file)
+DEFAULT_SPECIAL_TOKENS = {
+    "<pad>": 0,
+    "<unk>": 1,
+    "<bos>": 2,
+    "<eos>": 3,
+}
 
 
-def set_seed(seed: int) -> None:
-    """
-    Set random seeds for reproducible training.
-    """
-
-    random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+BYTE_TOKEN_START = 256
+BYTE_VOCAB_SIZE = 256
 
 
-def select_device() -> torch.device:
-    """
-    Select an available device.
-    """
+def load_corpus(
+    data_directory: str | Path,
+) -> str:
+    """Load supported text files into one training corpus."""
 
-    if torch.cuda.is_available():
-        return torch.device("cuda")
+    data_directory = Path(data_directory)
 
-    return torch.device("cpu")
-
-
-class TextDataset(Dataset):
-    """
-    Next-token prediction dataset.
-    """
-
-    def __init__(
-        self,
-        token_ids: list[int],
-        context_length: int,
-    ):
-        if len(token_ids) <= context_length:
-            raise ValueError(
-                "Dataset must contain more tokens than "
-                "the context length."
-            )
-
-        self.token_ids = torch.tensor(
-            token_ids,
-            dtype=torch.long,
-        )
-
-        self.context_length = context_length
-
-    def __len__(self) -> int:
-        return (
-            len(self.token_ids)
-            - self.context_length
-        )
-
-    def __getitem__(
-        self,
-        index: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_ids = self.token_ids[
-            index:
-            index + self.context_length
-        ]
-
-        targets = self.token_ids[
-            index + 1:
-            index + self.context_length + 1
-        ]
-
-        return input_ids, targets
-
-
-def load_token_ids(
-    path: Path,
-) -> list[int]:
-    """
-    Load token IDs from a text file.
-
-    The file must contain one integer token ID per line.
-    """
-
-    if not path.exists():
+    if not data_directory.exists():
         raise FileNotFoundError(
-            f"Token dataset does not exist: {path}"
+            f"Dataset directory does not exist: "
+            f"{data_directory}"
         )
 
-    token_ids = [
-        int(line.strip())
-        for line in path.read_text(
-            encoding="utf-8"
-        ).splitlines()
-        if line.strip()
-    ]
+    texts = []
 
-    if not token_ids:
+    supported_extensions = {
+        ".txt",
+        ".md",
+        ".json",
+        ".jsonl",
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".lua",
+        ".luau",
+        ".cpp",
+        ".cc",
+        ".cxx",
+        ".c",
+        ".h",
+        ".hpp",
+        ".cs",
+        ".java",
+        ".rs",
+        ".go",
+        ".html",
+        ".css",
+        ".xml",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".cmake",
+        ".sh",
+        ".ps1",
+    }
+
+    for path in sorted(data_directory.rglob("*")):
+        if not path.is_file():
+            continue
+
+        if path.suffix.lower() not in supported_extensions:
+            continue
+
+        try:
+            text = path.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
+        except OSError:
+            continue
+
+        if text:
+            texts.append(text)
+
+    if not texts:
         raise ValueError(
-            f"Token dataset is empty: {path}"
+            f"No supported training files found in: "
+            f"{data_directory}"
         )
 
-    return token_ids
+    return "\n\n".join(texts)
 
 
-def build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    max_steps: int,
-    min_learning_rate_ratio: float,
-):
+def byte_token(value: int) -> str:
+    """Return the vocabulary representation of a byte."""
+
+    return f"<byte:{value}>"
+
+
+def build_initial_vocabulary(
+    special_tokens: dict[str, int],
+) -> dict[str, int]:
+    """Create the mandatory special-token and byte vocabulary."""
+
+    vocabulary = dict(special_tokens)
+
+    used_ids = set(vocabulary.values())
+
+    next_id = max(
+        used_ids,
+        default=-1,
+    ) + 1
+
+    for value in range(BYTE_VOCAB_SIZE):
+        token = byte_token(value)
+
+        if token in vocabulary:
+            continue
+
+        while next_id in used_ids:
+            next_id += 1
+
+        vocabulary[token] = next_id
+        used_ids.add(next_id)
+
+        next_id += 1
+
+    return vocabulary
+
+
+def encode_words(
+    corpus: str,
+) -> dict[str, list[str]]:
     """
-    Build a linear-warmup + cosine-decay scheduler.
+    Convert whitespace-delimited corpus segments into byte symbols.
+
+    Whitespace is intentionally preserved because it is meaningful
+    training data. Each whitespace-delimited segment is independently
+    represented as UTF-8 byte symbols.
     """
 
-    def learning_rate_lambda(
-        step: int,
-    ) -> float:
-        if step < warmup_steps:
-            return max(
-                step / max(
-                    warmup_steps,
-                    1,
-                ),
-                1e-8,
-            )
+    words = corpus.split()
 
-        progress = (
-            step - warmup_steps
-        ) / max(
-            max_steps - warmup_steps,
-            1,
-        )
+    return {
+        word: [
+            byte_token(value)
+            for value in word.encode("utf-8")
+        ]
+        for word in words
+    }
 
-        progress = min(
-            max(progress, 0.0),
-            1.0,
-        )
 
-        cosine = 0.5 * (
-            1.0
-            + math.cos(
-                progress * math.pi
-            )
-        )
+def build_word_frequency(
+    corpus: str,
+) -> Counter[str]:
+    """Count repeated whitespace-delimited corpus segments."""
 
-        return (
-            min_learning_rate_ratio
-            + (
-                1.0
-                - min_learning_rate_ratio
-            )
-            * cosine
-        )
-
-    return torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        learning_rate_lambda,
+    return Counter(
+        corpus.split()
     )
+
+
+def count_pairs(
+    word_symbols: dict[str, list[str]],
+    word_frequency: Counter[str],
+) -> Counter[tuple[str, str]]:
+    """Count adjacent BPE symbol pairs weighted by frequency."""
+
+    pair_counts = Counter()
+
+    for word, symbols in word_symbols.items():
+        frequency = word_frequency[word]
+
+        for index in range(
+            len(symbols) - 1
+        ):
+            pair = (
+                symbols[index],
+                symbols[index + 1],
+            )
+
+            pair_counts[pair] += frequency
+
+    return pair_counts
+
+
+def merge_pair(
+    word_symbols: dict[str, list[str]],
+    pair: tuple[str, str],
+) -> None:
+    """Apply one BPE merge to every affected word."""
+
+    left, right = pair
+    merged_symbol = left + right
+
+    for word, symbols in word_symbols.items():
+        merged = []
+        index = 0
+
+        while index < len(symbols):
+            if (
+                index < len(symbols) - 1
+                and symbols[index] == left
+                and symbols[index + 1] == right
+            ):
+                merged.append(
+                    merged_symbol
+                )
+
+                index += 2
+
+            else:
+                merged.append(
+                    symbols[index]
+                )
+
+                index += 1
+
+        word_symbols[word] = merged
+
+
+def train_bpe(
+    corpus: str,
+    vocab_size: int,
+    special_tokens: dict[str, int] | None = None,
+) -> GraphiteTokenizer:
+    """
+    Train a byte-level BPE tokenizer.
+
+    The tokenizer always starts with:
+        - special tokens
+        - all 256 possible byte values
+
+    Additional vocabulary entries are learned through BPE merges.
+    """
+
+    if vocab_size < (
+        len(DEFAULT_SPECIAL_TOKENS)
+        + BYTE_VOCAB_SIZE
+    ):
+        raise ValueError(
+            "vocab_size must be at least "
+            f"{len(DEFAULT_SPECIAL_TOKENS) + BYTE_VOCAB_SIZE} "
+            "for byte-level BPE."
+        )
+
+    special_tokens = (
+        special_tokens.copy()
+        if special_tokens is not None
+        else DEFAULT_SPECIAL_TOKENS.copy()
+    )
+
+    vocabulary = build_initial_vocabulary(
+        special_tokens
+    )
+
+    word_frequency = build_word_frequency(
+        corpus
+    )
+
+    if not word_frequency:
+        raise ValueError(
+            "Corpus contains no usable text."
+        )
+
+    word_symbols = encode_words(
+        corpus
+    )
+
+    merges: list[tuple[str, str]] = []
+
+    while len(vocabulary) < vocab_size:
+        pair_counts = count_pairs(
+            word_symbols,
+            word_frequency,
+        )
+
+        if not pair_counts:
+            break
+
+        best_pair = max(
+            pair_counts,
+            key=lambda pair: (
+                pair_counts[pair],
+                pair,
+            ),
+        )
+
+        merged_symbol = (
+            best_pair[0]
+            + best_pair[1]
+        )
+
+        if merged_symbol in vocabulary:
+            merge_pair(
+                word_symbols,
+                best_pair,
+            )
+
+            continue
+
+        vocabulary[
+            merged_symbol
+        ] = len(vocabulary)
+
+        merges.append(
+            best_pair
+        )
+
+        merge_pair(
+            word_symbols,
+            best_pair,
+        )
+
+    return GraphiteTokenizer(
+        vocabulary=vocabulary,
+        merges=merges,
+        special_tokens=special_tokens,
+    )
+
+
+def train_tokenizer(
+    data_directory: str | Path,
+    output_path: str | Path,
+    vocab_size: int = 32000,
+) -> GraphiteTokenizer:
+    """Train and save the Graphite tokenizer."""
+
+    corpus = load_corpus(
+        data_directory
+    )
+
+    tokenizer = train_bpe(
+        corpus=corpus,
+        vocab_size=vocab_size,
+    )
+
+    tokenizer.save(
+        output_path
+    )
+
+    return tokenizer
 
 
 def main() -> None:
-    """
-    Run Graphite training.
-    """
+    project_root = Path(__file__).resolve().parents[1]
 
-    project_root = MODEL_ROOT
-
-    config_directory = (
-        project_root / "config"
-    )
-
-    model_config = load_json(
-        config_directory / "model.json"
-    )
-
-    training_config = load_json(
-        config_directory / "training.json"
-    )
-
-    architecture = model_config[
-        "architecture"
-    ]
-
-    training = training_config[
-        "training"
-    ]
-
-    optimizer_config = training_config[
-        "optimizer"
-    ]
-
-    scheduler_config = training_config[
-        "scheduler"
-    ]
-
-    seed = training_config[
-        "reproducibility"
-    ]["seed"]
-
-    set_seed(seed)
-
-    device = select_device()
-
-    print(
-        f"Device: {device}"
-    )
-
-    token_dataset_path = (
+    data_directory = (
         project_root
         / "data"
-        / "processed"
-        / "tokens.txt"
+        / "datasets"
     )
 
-    token_ids = load_token_ids(
-        token_dataset_path
+    output_path = (
+        project_root
+        / "tokenizer"
+        / "files"
+        / "tokenizer.json"
     )
 
-    print(
-        f"Token count: {len(token_ids)}"
-    )
-
-    context_length = min(
-        architecture["context_length"],
-        len(token_ids) - 1,
-    )
-
-    if context_length < 1:
-        raise ValueError(
-            "Not enough tokens for training."
-        )
-
-    dataset = TextDataset(
-        token_ids=token_ids,
-        context_length=context_length,
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=min(
-            training["batch_size"],
-            len(dataset),
-        ),
-        shuffle=True,
-        drop_last=False,
-        pin_memory=(
-            device.type == "cuda"
-        ),
-    )
-
-    model = GraphiteModel(
-        vocab_size=architecture[
-            "vocab_size"
-        ],
-        context_length=architecture[
-            "context_length"
-        ],
-        hidden_size=architecture[
-            "hidden_size"
-        ],
-        num_layers=architecture[
-            "num_layers"
-        ],
-        num_attention_heads=architecture[
-            "num_attention_heads"
-        ],
-        intermediate_size=architecture[
-            "intermediate_size"
-        ],
-        activation=architecture[
-            "activation"
-        ],
-        normalization_epsilon=architecture[
-            "normalization_epsilon"
-        ],
-    )
-
-    model.to(device)
-
-    parameter_count = sum(
-        parameter.numel()
-        for parameter in model.parameters()
+    tokenizer = train_tokenizer(
+        data_directory=data_directory,
+        output_path=output_path,
+        vocab_size=32000,
     )
 
     print(
-        f"Parameters: {parameter_count:,}"
+        f"Tokenizer vocabulary size: "
+        f"{tokenizer.vocab_size}"
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=training["learning_rate"],
-        betas=tuple(
-            optimizer_config["betas"]
-        ),
-        eps=optimizer_config[
-            "epsilon"
-        ],
-        weight_decay=training[
-            "weight_decay"
-        ],
+    print(
+        f"Learned merges: "
+        f"{len(tokenizer.merges)}"
     )
 
-    min_learning_rate = training[
-        "min_learning_rate"
-    ]
-
-    min_learning_rate_ratio = (
-        min_learning_rate
-        / training["learning_rate"]
-    )
-
-    scheduler = build_scheduler(
-        optimizer=optimizer,
-        warmup_steps=scheduler_config[
-            "warmup_steps"
-        ],
-        max_steps=training[
-            "max_steps"
-        ],
-        min_learning_rate_ratio=(
-            min_learning_rate_ratio
-        ),
-    )
-
-    run_id = (
-        f"run-{seed}"
-    )
-
-    trainer = Trainer(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        max_steps=training[
-            "max_steps"
-        ],
-        gradient_accumulation_steps=training[
-            "gradient_accumulation_steps"
-        ],
-        gradient_clip_norm=training[
-            "gradient_clip_norm"
-        ],
-        checkpoint_every=training_config[
-            "checkpointing"
-        ]["save_every_steps"],
-        checkpoint_directory=str(
-            project_root
-            / "training"
-            / "runs"
-        ),
-        run_id=run_id,
-        log_every=training_config[
-            "logging"
-        ]["log_every_steps"],
-    )
-
-    trainer.train(
-        dataloader=dataloader,
+    print(
+        f"Tokenizer written to: "
+        f"{output_path}"
     )
 
 
