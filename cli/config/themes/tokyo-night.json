@@ -1,0 +1,61 @@
+{
+  "name": "tokyo-night",
+
+  "colors": {
+    "background": "#1a1b26",
+    "background_alt": "#16161e",
+    "background_highlight": "#292e42",
+
+    "foreground": "#c0caf5",
+    "foreground_alt": "#a9b1d6",
+    "muted": "#565f89",
+
+    "black": "#414868",
+    "red": "#f7768e",
+    "orange": "#ff9e64",
+    "yellow": "#e0af68",
+    "green": "#9ece6a",
+    "cyan": "#7dcfff",
+    "blue": "#7aa2f7",
+    "purple": "#9d7cd8",
+    "magenta": "#bb9af7",
+    "white": "#c0caf5",
+
+    "bright_black": "#565f89",
+    "bright_red": "#f7768e",
+    "bright_orange": "#ff9e64",
+    "bright_yellow": "#e0af68",
+    "bright_green": "#9ece6a",
+    "bright_cyan": "#7dcfff",
+    "bright_blue": "#7aa2f7",
+    "bright_purple": "#9d7cd8",
+    "bright_magenta": "#bb9af7",
+    "bright_white": "#ffffff"
+  },
+
+  "usage": {
+    "background": "background",
+    "foreground": "foreground",
+
+    "logo": "red",
+    "you": "red",
+
+    "input": "foreground",
+    "prompt": "red",
+    "placeholder": "muted",
+    "cursor": "foreground",
+
+    "separator": "background_highlight",
+    "border": "background_highlight",
+
+    "selection_background": "background_highlight",
+    "selection_foreground": "foreground",
+
+    "success": "green",
+    "warning": "yellow",
+    "error": "red",
+    "info": "cyan",
+
+    "muted": "muted"
+  }
+}
