@@ -17,20 +17,14 @@ fn run() -> io::Result<()> {
             Some(text) => {
                 let text = text.trim();
 
-                if text == "/exit" || text == "/quit" {
-                    break;
-                }
-
                 if !text.is_empty() {
                     input.add_message(text);
                 }
             }
-
             None => break,
         }
     }
 
     shell::input::InputBox::stop(terminal)?;
-
     Ok(())
 }
