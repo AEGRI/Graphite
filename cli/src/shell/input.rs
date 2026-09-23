@@ -16,12 +16,14 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
 use serde::Deserialize;
+
+const MAX_INPUT_LINES: usize = 5;
 
 const LOGO: &str = r#"
  ██████╗ ██████╗  █████╗ ██████╗ ██╗  ██╗██╗████████╗███████╗
@@ -106,7 +108,6 @@ struct ThemeUsage {
 impl Theme {
     fn load() -> io::Result<Self> {
         let config_path = Path::new("cli/config/config.toml");
-
         let config_text = fs::read_to_string(config_path).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -229,17 +230,13 @@ fn set_terminal_background(color: Color) -> io::Result<()> {
     };
 
     let mut stdout = stdout();
-
     write!(stdout, "\x1b]11;rgb:{red:02x}/{green:02x}/{blue:02x}\x07")?;
-
     stdout.flush()
 }
 
 fn reset_terminal_background() -> io::Result<()> {
     let mut stdout = stdout();
-
     write!(stdout, "\x1b]111\x07")?;
-
     stdout.flush()
 }
 
@@ -266,6 +263,26 @@ impl Selection {
 enum MouseSelection {
     Input { anchor: usize },
     History { message_index: usize, anchor: usize },
+}
+
+#[derive(Debug, Clone)]
+struct WrappedLine {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MessageLayout {
+    message_index: usize,
+    top: u16,
+    height: u16,
+    width: u16,
+    x: u16,
+    text_top: u16,
+    text_lines: usize,
+    separator_width: u16,
+    right_aligned: bool,
 }
 
 pub struct InputBox {
@@ -314,12 +331,10 @@ impl InputBox {
         enable_raw_mode()?;
 
         let mut stdout = stdout();
-
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
-
         terminal.clear()?;
         terminal.show_cursor()?;
 
@@ -328,22 +343,18 @@ impl InputBox {
 
     pub fn stop(mut terminal: Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
         disable_raw_mode()?;
-
         execute!(
             terminal.backend_mut(),
             DisableMouseCapture,
             LeaveAlternateScreen
         )?;
-
         reset_terminal_background()?;
         terminal.show_cursor()?;
-
         Ok(())
     }
 
     pub fn add_message(&mut self, message: &str) {
         self.messages.push(message.to_string());
-
         self.text.clear();
         self.cursor = 0;
         self.input_selection_anchor = None;
@@ -354,17 +365,105 @@ impl InputBox {
         self.dirty = true;
     }
 
-    fn terminal_layout(area: Rect) -> [Rect; 3] {
+    fn terminal_layout(&self, area: Rect) -> [Rect; 3] {
+        let height = area.height;
+
+        let header_height = if height >= 24 {
+            9
+        } else if height >= 18 {
+            7
+        } else if height >= 12 {
+            6
+        } else {
+            4
+        }
+        .min(height.saturating_sub(3));
+
+        let input_lines = self.input_lines(area).min(MAX_INPUT_LINES);
+        let desired_input_height = input_lines.saturating_add(2) as u16;
+        let max_input_height = height.saturating_sub(header_height.saturating_add(1));
+        let input_height = desired_input_height.min(max_input_height).max(1);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(9),
+                Constraint::Length(header_height),
                 Constraint::Min(1),
-                Constraint::Length(3),
+                Constraint::Length(input_height),
             ])
             .split(area);
 
         [chunks[0], chunks[1], chunks[2]]
+    }
+
+    fn input_wrap_width(&self, area: Rect) -> usize {
+        area.width.saturating_sub(5).max(1) as usize
+    }
+
+    fn input_lines(&self, area: Rect) -> usize {
+        let width = self.input_wrap_width(area);
+        self.text.chars().count().div_ceil(width).max(1)
+    }
+
+    fn input_scroll_offset(&self, area: Rect) -> usize {
+        let total_lines = self.input_lines(area);
+        let visible_lines = total_lines.min(MAX_INPUT_LINES);
+        let width = self.input_wrap_width(area);
+        let cursor_line = self.cursor / width;
+
+        if total_lines <= visible_lines {
+            return 0;
+        }
+
+        cursor_line
+            .saturating_sub(visible_lines.saturating_sub(1))
+            .min(total_lines.saturating_sub(visible_lines))
+    }
+
+    fn wrapped_input(&self, area: Rect) -> Vec<WrappedLine> {
+        let width = self.input_wrap_width(area);
+        let chars: Vec<char> = self.text.chars().collect();
+
+        if chars.is_empty() {
+            return vec![WrappedLine {
+                text: String::new(),
+                start: 0,
+                end: 0,
+            }];
+        }
+
+        chars
+            .chunks(width)
+            .enumerate()
+            .map(|(line, chunk)| {
+                let start = line * width;
+                let end = start + chunk.len();
+                WrappedLine {
+                    text: chunk.iter().collect(),
+                    start,
+                    end,
+                }
+            })
+            .collect()
+    }
+
+    fn move_cursor_vertical(&mut self, direction: i32, area: Rect, selecting: bool) {
+        let width = self.input_wrap_width(area);
+        let current_line = self.cursor / width;
+        let current_column = self.cursor % width;
+        let line_count = self.input_lines(area);
+
+        let target_line = if direction < 0 {
+            current_line.saturating_sub(1)
+        } else {
+            (current_line + 1).min(line_count.saturating_sub(1))
+        };
+
+        let target_start = target_line * width;
+        let target_end = ((target_line + 1) * width).min(self.text.chars().count());
+        let target = (target_start + current_column).min(target_end);
+
+        self.move_cursor(target, selecting);
     }
 
     fn clear_selection(&mut self) {
@@ -429,7 +528,6 @@ impl InputBox {
 
         let start = char_to_byte_index(&self.text, selection.start);
         let end = char_to_byte_index(&self.text, selection.end);
-
         let selected = self.text[start..end].to_string();
 
         let mut clipboard = Clipboard::new()
@@ -463,7 +561,6 @@ impl InputBox {
         self.delete_selected_input();
 
         let byte_index = char_to_byte_index(&self.text, self.cursor);
-
         self.text.insert_str(byte_index, &text);
         self.cursor += text.chars().count();
 
@@ -492,7 +589,6 @@ impl InputBox {
         self.delete_selected_input();
 
         let byte_index = char_to_byte_index(&self.text, self.cursor);
-
         self.text.insert(byte_index, character);
         self.cursor += 1;
 
@@ -613,64 +709,213 @@ impl InputBox {
         self.dirty = true;
     }
 
-    fn message_lines(&self) -> Vec<Line<'static>> {
-        let you_color = self.theme.usage_color("you");
-        let input_color = self.theme.usage_color("input");
-        let selection_background = self.theme.usage_color("selection_background");
-        let selection_foreground = self.theme.usage_color("selection_foreground");
+    fn message_width(&self, chat_area: Rect) -> u16 {
+        let width = chat_area.width;
+
+        if width <= 4 {
+            return width;
+        }
+
+        ((width as u32 * 62) / 100)
+            .max(12)
+            .min(width.saturating_sub(2) as u32) as u16
+    }
+
+    fn wrap_message(&self, message: &str, width: usize) -> Vec<WrappedLine> {
+        let width = width.max(1);
+        let chars: Vec<char> = message.chars().collect();
+
+        if chars.is_empty() {
+            return vec![WrappedLine {
+                text: String::new(),
+                start: 0,
+                end: 0,
+            }];
+        }
 
         let mut lines = Vec::new();
+        let mut line_start = 0usize;
+        let mut position = 0usize;
 
-        for (message_index, message) in self.messages.iter().enumerate() {
-            lines.push(Line::from(vec![Span::styled(
-                "You",
-                Style::default().fg(you_color).add_modifier(Modifier::BOLD),
-            )]));
-
-            let selection = self
-                .history_selection
-                .filter(|(index, _)| *index == message_index)
-                .map(|(_, selection)| selection);
-
-            let mut spans = Vec::new();
-
-            for (index, character) in message.chars().enumerate() {
-                let mut style = Style::default().fg(input_color);
-
-                if let Some(selection) = selection {
-                    if index >= selection.start && index < selection.end {
-                        style = style.fg(selection_foreground).bg(selection_background);
-                    }
-                }
-
-                spans.push(Span::styled(character.to_string(), style));
+        while line_start < chars.len() {
+            if chars[line_start] == '\n' {
+                lines.push(WrappedLine {
+                    text: String::new(),
+                    start: line_start,
+                    end: line_start,
+                });
+                line_start += 1;
+                position = line_start;
+                continue;
             }
 
-            lines.push(Line::from(spans));
-            lines.push(Line::from(""));
+            let mut line_end = line_start;
+            let mut last_space = None;
+
+            while position < chars.len() && position < line_start + width {
+                if chars[position] == '\n' {
+                    break;
+                }
+
+                if chars[position].is_whitespace() {
+                    last_space = Some(position);
+                }
+
+                position += 1;
+                line_end = position;
+            }
+
+            if position >= chars.len() || chars.get(position) == Some(&'\n') {
+                let end = if line_end > line_start && chars[line_end - 1].is_whitespace() {
+                    line_end - 1
+                } else {
+                    line_end
+                };
+
+                lines.push(WrappedLine {
+                    text: chars[line_start..end].iter().collect(),
+                    start: line_start,
+                    end,
+                });
+
+                if position < chars.len() && chars[position] == '\n' {
+                    line_start = position + 1;
+                    position = line_start;
+                } else {
+                    line_start = chars.len();
+                }
+
+                continue;
+            }
+
+            if let Some(space) = last_space.filter(|space| *space > line_start) {
+                let end = space;
+                lines.push(WrappedLine {
+                    text: chars[line_start..end].iter().collect(),
+                    start: line_start,
+                    end,
+                });
+
+                line_start = space + 1;
+                while line_start < chars.len()
+                    && chars[line_start].is_whitespace()
+                    && chars[line_start] != '\n'
+                {
+                    line_start += 1;
+                }
+                position = line_start;
+            } else {
+                let end = line_start + width;
+                lines.push(WrappedLine {
+                    text: chars[line_start..end].iter().collect(),
+                    start: line_start,
+                    end,
+                });
+
+                line_start = end;
+                position = line_start;
+            }
+        }
+
+        if lines.is_empty() {
+            lines.push(WrappedLine {
+                text: String::new(),
+                start: 0,
+                end: 0,
+            });
         }
 
         lines
     }
 
-    fn chat_line_count(&self) -> u16 {
-        self.messages.len().saturating_mul(3).min(u16::MAX as usize) as u16
-    }
+    fn message_layouts(&self, chat_area: Rect) -> Vec<MessageLayout> {
+        let message_width = self.message_width(chat_area) as usize;
+        let mut layouts = Vec::with_capacity(self.messages.len());
+        let mut top = 0u16;
 
-    fn max_chat_scroll(&self, visible_height: u16) -> u16 {
-        self.chat_line_count().saturating_sub(visible_height)
-    }
+        for (message_index, message) in self.messages.iter().enumerate() {
+            let wrapped = self.wrap_message(message, message_width);
+            let text_lines = wrapped.len();
+            let separator_width = wrapped
+                .iter()
+                .map(|line| line.text.chars().count())
+                .max()
+                .unwrap_or(0)
+                .min(message_width) as u16;
 
-    fn scroll_up(&mut self, amount: u16, visible_height: u16) {
-        let max_scroll = self.max_chat_scroll(visible_height);
+            let width = message_width as u16;
+            let height = (text_lines + 3).min(u16::MAX as usize) as u16;
+            let right_aligned = true;
+            let x = if right_aligned {
+                chat_area
+                    .x
+                    .saturating_add(chat_area.width.saturating_sub(width))
+            } else {
+                chat_area.x
+            };
 
-        self.chat_scroll = self.chat_scroll.saturating_add(amount).min(max_scroll);
-        self.follow_bottom = self.chat_scroll == 0;
+            layouts.push(MessageLayout {
+                message_index,
+                top,
+                height,
+                width,
+                x,
+                text_top: top + 1,
+                text_lines,
+                separator_width,
+                right_aligned,
+            });
 
-        if max_scroll > 0 && self.chat_scroll < max_scroll {
-            self.follow_bottom = false;
+            top = top.saturating_add(height);
         }
 
+        layouts
+    }
+
+    fn chat_line_count(&self, chat_area: Rect) -> u16 {
+        self.message_layouts(chat_area)
+            .last()
+            .map(|layout| layout.top.saturating_add(layout.height))
+            .unwrap_or(0)
+    }
+
+    fn max_chat_scroll(&self, chat_area: Rect) -> u16 {
+        self.chat_line_count(chat_area)
+            .saturating_sub(chat_area.height)
+    }
+
+    // chat_scroll is the distance from the bottom of the history.
+    // 0 means the newest messages are visible; increasing it moves upward.
+    fn chat_scroll_offset(&self, chat_area: Rect) -> u16 {
+        let max_scroll = self.max_chat_scroll(chat_area);
+
+        if self.follow_bottom {
+            max_scroll
+        } else {
+            max_scroll.saturating_sub(self.chat_scroll.min(max_scroll))
+        }
+    }
+
+    fn scroll_up(&mut self, amount: u16, chat_area: Rect) {
+        let max_scroll = self.max_chat_scroll(chat_area);
+
+        if max_scroll == 0 {
+            self.follow_bottom = true;
+            self.chat_scroll = 0;
+            self.dirty = true;
+            return;
+        }
+
+        // Start from the current distance from the bottom. If we're following
+        // the newest messages, that's zero. Never recreate or discard history;
+        // this only changes which part of the existing history is visible.
+        self.chat_scroll = if self.follow_bottom {
+            amount.min(max_scroll)
+        } else {
+            self.chat_scroll.saturating_add(amount).min(max_scroll)
+        };
+
+        self.follow_bottom = false;
         self.dirty = true;
     }
 
@@ -679,20 +924,41 @@ impl InputBox {
 
         if self.chat_scroll == 0 {
             self.follow_bottom = true;
+        } else {
+            self.follow_bottom = false;
         }
 
         self.dirty = true;
     }
 
-    fn input_index_from_mouse(&self, column: u16, input_area: Rect) -> usize {
+    fn scroll_to_top(&mut self, chat_area: Rect) {
+        let max_scroll = self.max_chat_scroll(chat_area);
+        self.chat_scroll = max_scroll;
+        self.follow_bottom = false;
+        self.dirty = true;
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.chat_scroll = 0;
+        self.follow_bottom = true;
+        self.dirty = true;
+    }
+
+    fn input_index_from_mouse(&self, column: u16, row: u16, input_area: Rect) -> usize {
+        let width = self.input_wrap_width(input_area);
+        let visible_line = row
+            .saturating_sub(input_area.y.saturating_add(1))
+            .min(MAX_INPUT_LINES.saturating_sub(1) as u16) as usize;
+        let line = self.input_scroll_offset(input_area) + visible_line;
         let start_x = input_area.x + 3;
 
-        if column <= start_x {
-            return 0;
-        }
+        let column = if column <= start_x {
+            0
+        } else {
+            column.saturating_sub(start_x) as usize
+        };
 
-        let position = column.saturating_sub(start_x) as usize;
-
+        let position = line * width + column.min(width);
         position.min(self.text.chars().count())
     }
 
@@ -706,44 +972,68 @@ impl InputBox {
             return None;
         }
 
-        let max_scroll = self.max_chat_scroll(chat_area.height);
+        let layouts = self.message_layouts(chat_area);
+        let scroll = self.chat_scroll_offset(chat_area);
 
-        let scroll = if self.follow_bottom {
-            max_scroll
-        } else {
-            self.chat_scroll.min(max_scroll)
-        };
+        let absolute_row = row.saturating_sub(chat_area.y).saturating_add(scroll);
 
-        let relative_row = row.saturating_sub(chat_area.y) as usize + scroll as usize;
+        for layout in layouts {
+            if absolute_row < layout.top || absolute_row >= layout.top.saturating_add(layout.height)
+            {
+                continue;
+            }
 
-        let message_index = relative_row / 3;
-        let line_index = relative_row % 3;
+            let relative_row = absolute_row.saturating_sub(layout.top);
 
-        // Each message is:
-        // 0 = "You"
-        // 1 = message
-        // 2 = blank
-        if line_index != 1 {
+            if relative_row == 0 {
+                return None;
+            }
+
+            if relative_row >= 1 && relative_row <= layout.text_lines as u16 {
+                let message = self.messages.get(layout.message_index)?;
+                let wrapped = self.wrap_message(message, layout.width as usize);
+                let line = wrapped.get(relative_row as usize - 1)?;
+
+                let relative_column = if layout.right_aligned {
+                    let right_edge = layout.x.saturating_add(line.text.chars().count() as u16);
+
+                    if column >= right_edge {
+                        line.text.chars().count()
+                    } else if column <= layout.x {
+                        0
+                    } else {
+                        column.saturating_sub(layout.x) as usize
+                    }
+                } else {
+                    if column <= layout.x {
+                        0
+                    } else {
+                        column
+                            .saturating_sub(layout.x)
+                            .min(line.text.chars().count() as u16) as usize
+                    }
+                };
+
+                return Some((
+                    layout.message_index,
+                    (line.start + relative_column).min(line.end),
+                ));
+            }
+
             return None;
         }
 
-        let message = self.messages.get(message_index)?;
-
-        let index = (column.saturating_sub(chat_area.x) as usize).min(message.chars().count());
-
-        Some((message_index, index))
+        None
     }
 
     fn begin_mouse_selection(&mut self, column: u16, row: u16, chat_area: Rect, input_area: Rect) {
         if row >= input_area.y && row < input_area.y.saturating_add(input_area.height) {
-            let position = self.input_index_from_mouse(column, input_area);
-
+            let position = self.input_index_from_mouse(column, row, input_area);
             self.cursor = position;
             self.input_selection_anchor = Some(position);
             self.history_selection = None;
             self.mouse_selection = Some(MouseSelection::Input { anchor: position });
             self.dirty = true;
-
             return;
         }
 
@@ -751,13 +1041,11 @@ impl InputBox {
             self.history_index_from_mouse(column, row, chat_area)
         {
             self.history_selection = Some((message_index, Selection::new(position, position)));
-
             self.input_selection_anchor = None;
             self.mouse_selection = Some(MouseSelection::History {
                 message_index,
                 anchor: position,
             });
-
             self.dirty = true;
         }
     }
@@ -770,15 +1058,13 @@ impl InputBox {
         match selection {
             MouseSelection::Input { anchor } => {
                 if row >= input_area.y && row < input_area.y.saturating_add(input_area.height) {
-                    let position = self.input_index_from_mouse(column, input_area);
-
+                    let position = self.input_index_from_mouse(column, row, input_area);
                     self.cursor = position;
                     self.input_selection_anchor = Some(anchor);
                     self.history_selection = None;
                     self.dirty = true;
                 }
             }
-
             MouseSelection::History {
                 message_index,
                 anchor,
@@ -789,12 +1075,175 @@ impl InputBox {
                     if index == message_index {
                         self.history_selection =
                             Some((message_index, Selection::new(anchor, position)));
-
                         self.input_selection_anchor = None;
                         self.dirty = true;
                     }
                 }
             }
+        }
+    }
+
+    fn draw_logo(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let lines: Vec<Line> = LOGO
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| Line::styled(line, Style::default().fg(self.theme.usage_color("logo"))))
+            .collect();
+
+        if lines.is_empty() || area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let logo_height = lines.len().min(area.height as usize) as u16;
+        let logo_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: logo_height,
+        };
+
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Left), logo_area);
+    }
+
+    fn draw_message(&self, frame: &mut ratatui::Frame, chat_area: Rect, layout: MessageLayout) {
+        let message = match self.messages.get(layout.message_index) {
+            Some(message) => message,
+            None => return,
+        };
+
+        let wrapped = self.wrap_message(message, layout.width as usize);
+        let selection = self
+            .history_selection
+            .filter(|(index, _)| *index == layout.message_index)
+            .map(|(_, selection)| selection);
+
+        let text_color = self.theme.usage_color("input");
+        let you_color = self.theme.usage_color("you");
+        let separator_color = self.theme.usage_color("separator");
+        let selection_background = self.theme.usage_color("selection_background");
+        let selection_foreground = self.theme.usage_color("selection_foreground");
+
+        let scroll = self.chat_scroll_offset(chat_area);
+        let message_y = chat_area
+            .y
+            .saturating_add(layout.top)
+            .saturating_sub(scroll);
+
+        // The chat is the background layer. Everything is explicitly clipped to
+        // chat_area so it can never draw over the header or input foreground.
+        let chat_bottom = chat_area.y.saturating_add(chat_area.height);
+        let message_bottom = message_y.saturating_add(layout.height);
+
+        if message_y >= chat_bottom || message_bottom <= chat_area.y {
+            return;
+        }
+
+        let visible_top = chat_area.y.max(message_y);
+        let visible_bottom = chat_bottom.min(message_bottom);
+
+        let message_area = Rect {
+            x: layout.x,
+            y: message_y,
+            width: layout.width,
+            height: layout.height,
+        };
+
+        // Header / label.
+        if message_y >= visible_top && message_y < visible_bottom {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "You",
+                    Style::default().fg(you_color).add_modifier(Modifier::BOLD),
+                ))
+                .alignment(if layout.right_aligned {
+                    Alignment::Right
+                } else {
+                    Alignment::Left
+                }),
+                Rect {
+                    x: message_area.x,
+                    y: message_y,
+                    width: message_area.width,
+                    height: 1,
+                },
+            );
+        }
+
+        // Render only the message rows that actually intersect the chat area.
+        // This is the important clipping step: even when a message is scrolled
+        // upward, its lines cannot be painted into the header.
+        let text_start_row = visible_top.saturating_sub(message_y).saturating_sub(1) as usize;
+        let text_end_row = visible_bottom
+            .saturating_sub(message_y)
+            .saturating_sub(1)
+            .min(wrapped.len() as u16) as usize;
+
+        if text_start_row < text_end_row && text_start_row < wrapped.len() {
+            let visible_wrapped = &wrapped[text_start_row..text_end_row];
+            let text_y = message_y
+                .saturating_add(1)
+                .saturating_add(text_start_row as u16);
+
+            let lines = visible_wrapped
+                .iter()
+                .map(|wrapped_line| {
+                    let mut spans = Vec::with_capacity(wrapped_line.text.chars().count());
+
+                    for (offset, character) in wrapped_line.text.chars().enumerate() {
+                        let absolute_index = wrapped_line.start + offset;
+                        let mut style = Style::default().fg(text_color);
+
+                        if let Some(selection) = selection {
+                            if absolute_index >= selection.start && absolute_index < selection.end {
+                                style = style.fg(selection_foreground).bg(selection_background);
+                            }
+                        }
+
+                        spans.push(Span::styled(character.to_string(), style));
+                    }
+
+                    Line::from(spans)
+                })
+                .collect::<Vec<_>>();
+
+            frame.render_widget(
+                Paragraph::new(lines).alignment(if layout.right_aligned {
+                    Alignment::Right
+                } else {
+                    Alignment::Left
+                }),
+                Rect {
+                    x: message_area.x,
+                    y: text_y,
+                    width: message_area.width,
+                    height: (text_end_row - text_start_row) as u16,
+                },
+            );
+        }
+
+        // Separator.
+        let separator_y = message_y.saturating_add(1 + wrapped.len() as u16);
+
+        if separator_y >= chat_area.y && separator_y < chat_bottom {
+            let separator_width = layout.separator_width.max(1);
+            let separator_x = if layout.right_aligned {
+                message_area
+                    .x
+                    .saturating_add(message_area.width.saturating_sub(separator_width))
+            } else {
+                message_area.x
+            };
+
+            frame.render_widget(
+                Paragraph::new("─".repeat(separator_width as usize))
+                    .style(Style::default().fg(separator_color)),
+                Rect {
+                    x: separator_x,
+                    y: separator_y,
+                    width: separator_width.min(chat_area.width),
+                    height: 1,
+                },
+            );
         }
     }
 
@@ -804,24 +1253,19 @@ impl InputBox {
     ) -> io::Result<()> {
         terminal.draw(|frame| {
             let area = frame.area();
-            let layout = Self::terminal_layout(area);
+            let layout = self.terminal_layout(area);
 
-            let logo_color = self.theme.usage_color("logo");
-            let separator_color = self.theme.usage_color("separator");
-            let foreground_color = self.theme.usage_color("foreground");
-            let prompt_color = self.theme.usage_color("prompt");
-            let placeholder_color = self.theme.usage_color("placeholder");
-            let input_color = self.theme.usage_color("input");
-            let border_color = self.theme.usage_color("border");
-            let selection_background = self.theme.usage_color("selection_background");
-            let selection_foreground = self.theme.usage_color("selection_foreground");
+            let chat_area = layout[1];
+            let layouts = self.message_layouts(chat_area);
 
-            let logo_lines: Vec<Line> = LOGO
-                .lines()
-                .map(|line| Line::styled(line, Style::default().fg(logo_color)))
-                .collect();
+            // Chat is rendered behind the fixed header and input regions.
+            // Message rendering clips itself to chat_area, so scrolled text
+            // remains in history without painting across those boundaries.
+            for message_layout in layouts {
+                self.draw_message(frame, chat_area, message_layout);
+            }
 
-            frame.render_widget(Paragraph::new(logo_lines), layout[0]);
+            self.draw_logo(frame, layout[0]);
 
             let divider_area = Rect {
                 x: layout[0].x,
@@ -834,83 +1278,91 @@ impl InputBox {
 
             frame.render_widget(
                 Paragraph::new("─".repeat(divider_area.width as usize))
-                    .style(Style::default().fg(separator_color)),
+                    .style(Style::default().fg(self.theme.usage_color("separator"))),
                 divider_area,
-            );
-
-            let chat_area = layout[1];
-
-            let max_scroll = self.max_chat_scroll(chat_area.height);
-
-            let scroll = if self.follow_bottom {
-                max_scroll
-            } else {
-                self.chat_scroll.min(max_scroll)
-            };
-
-            frame.render_widget(
-                Paragraph::new(self.message_lines())
-                    .style(Style::default().fg(foreground_color))
-                    .scroll((scroll, 0)),
-                chat_area,
             );
 
             let input_area = layout[2];
             let selection = self.input_selection();
+            let wrapped = self.wrapped_input(input_area);
+            let visible_lines = wrapped.len().min(MAX_INPUT_LINES);
+            let scroll_offset = self.input_scroll_offset(input_area);
+            let visible_end = (scroll_offset + visible_lines).min(wrapped.len());
+            let visible_wrapped = &wrapped[scroll_offset..visible_end];
+            let mut lines = Vec::with_capacity(visible_wrapped.len());
 
-            let mut spans = Vec::new();
+            for (line_index, wrapped_line) in visible_wrapped.iter().enumerate() {
+                let line_index = line_index;
+                let mut spans = Vec::new();
 
-            spans.push(Span::styled(
-                "❯  ",
-                Style::default()
-                    .fg(prompt_color)
-                    .add_modifier(Modifier::BOLD),
-            ));
-
-            if self.text.is_empty() {
                 spans.push(Span::styled(
-                    "Ask anything...",
-                    Style::default().fg(placeholder_color),
+                    if line_index == 0 { "❯  " } else { "   " },
+                    Style::default()
+                        .fg(self.theme.usage_color("prompt"))
+                        .add_modifier(Modifier::BOLD),
                 ));
-            } else {
-                for (index, character) in self.text.chars().enumerate() {
-                    let mut style = Style::default().fg(input_color);
 
-                    if let Some(selection) = selection {
-                        if index >= selection.start && index < selection.end {
-                            style = style.fg(selection_foreground).bg(selection_background);
+                if self.text.is_empty() && line_index == 0 {
+                    spans.push(Span::styled(
+                        "Ask anything...",
+                        Style::default().fg(self.theme.usage_color("placeholder")),
+                    ));
+                } else {
+                    for (offset, character) in wrapped_line.text.chars().enumerate() {
+                        let index = wrapped_line.start + offset;
+                        let mut style = Style::default().fg(self.theme.usage_color("input"));
+
+                        if let Some(selection) = selection {
+                            if index >= selection.start && index < selection.end {
+                                style = style
+                                    .fg(self.theme.usage_color("selection_foreground"))
+                                    .bg(self.theme.usage_color("selection_background"));
+                            }
                         }
-                    }
 
-                    spans.push(Span::styled(character.to_string(), style));
+                        spans.push(Span::styled(character.to_string(), style));
+                    }
                 }
+
+                lines.push(Line::from(spans));
             }
 
             frame.render_widget(
-                Paragraph::new(Line::from(spans)).block(
+                Paragraph::new(lines).block(
                     Block::default()
                         .borders(Borders::TOP | Borders::BOTTOM)
-                        .border_style(Style::default().fg(border_color)),
+                        .border_style(Style::default().fg(self.theme.usage_color("border"))),
                 ),
                 input_area,
             );
 
+            let width = self.input_wrap_width(input_area);
+            let cursor_line = self.cursor / width;
+            let cursor_column = self.cursor % width;
+            let cursor_visible_line = cursor_line.saturating_sub(scroll_offset);
             let cursor_x = input_area
                 .x
                 .saturating_add(3)
-                .saturating_add(self.cursor as u16);
+                .saturating_add(cursor_column as u16)
+                .min(
+                    input_area
+                        .x
+                        .saturating_add(input_area.width.saturating_sub(1)),
+                );
+            let cursor_y = input_area
+                .y
+                .saturating_add(1)
+                .saturating_add(cursor_visible_line as u16)
+                .min(
+                    input_area
+                        .y
+                        .saturating_add(input_area.height.saturating_sub(1)),
+                );
 
-            let cursor_x = cursor_x.min(
-                input_area
-                    .x
-                    .saturating_add(input_area.width.saturating_sub(1)),
-            );
-
-            frame.set_cursor_position((cursor_x, input_area.y.saturating_add(1)));
+            frame.set_cursor_position((cursor_x, cursor_y));
         })?;
 
         self.dirty = false;
-
         Ok(())
     }
 
@@ -957,10 +1409,7 @@ impl InputBox {
                             }
                         }
 
-                        // CUT SELECTED TEXT FROM THE ASK ANYTHING BOX ONLY.
-                        //
-                        // History selections are intentionally ignored.
-                        // Nothing is removed unless an input selection exists.
+                        // Cut selected text from the Ask Anything box only.
                         KeyCode::Char('x') if modifiers.contains(KeyModifiers::CONTROL) => {
                             self.cut_input_selection()?;
                         }
@@ -1010,23 +1459,40 @@ impl InputBox {
                         }
 
                         KeyCode::PageUp => {
-                            let visible_height = terminal.size()?.height.saturating_sub(12);
-
-                            self.scroll_up(8, visible_height);
+                            let size = terminal.size()?;
+                            let area = Rect::new(0, 0, size.width, size.height);
+                            let layout = self.terminal_layout(area);
+                            self.scroll_up(2, layout[1]);
                         }
 
                         KeyCode::PageDown => {
-                            self.scroll_down(8);
+                            let size = terminal.size()?;
+                            let area = Rect::new(0, 0, size.width, size.height);
+                            let layout = self.terminal_layout(area);
+                            self.scroll_down(2);
                         }
 
                         KeyCode::Up => {
-                            let visible_height = terminal.size()?.height.saturating_sub(12);
+                            let size = terminal.size()?;
+                            let area = Rect::new(0, 0, size.width, size.height);
 
-                            self.scroll_up(1, visible_height);
+                            if self.input_lines(area) > 1 {
+                                self.move_cursor_vertical(-1, area, selecting);
+                            } else {
+                                let layout = self.terminal_layout(area);
+                                self.scroll_up(1, layout[1]);
+                            }
                         }
 
                         KeyCode::Down => {
-                            self.scroll_down(1);
+                            let size = terminal.size()?;
+                            let area = Rect::new(0, 0, size.width, size.height);
+
+                            if self.input_lines(area) > 1 {
+                                self.move_cursor_vertical(1, area, selecting);
+                            } else {
+                                self.scroll_down(1);
+                            }
                         }
 
                         _ => {}
@@ -1036,15 +1502,16 @@ impl InputBox {
                 Event::Mouse(mouse) => {
                     let size = terminal.size()?;
                     let area = Rect::new(0, 0, size.width, size.height);
-                    let layout = Self::terminal_layout(area);
+                    let layout = self.terminal_layout(area);
 
                     match mouse.kind {
                         MouseEventKind::ScrollUp => {
-                            self.scroll_up(3, layout[1].height);
+                            // Mouse wheel: move one terminal row at a time for smooth scrolling.
+                            self.scroll_up(1, layout[1]);
                         }
 
                         MouseEventKind::ScrollDown => {
-                            self.scroll_down(3);
+                            self.scroll_down(1);
                         }
 
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -1069,7 +1536,6 @@ impl InputBox {
                             self.mouse_selection = None;
 
                             let empty_input_selection = self.input_selection().is_none();
-
                             let empty_history_selection = self
                                 .history_selection
                                 .map(|(_, selection)| selection.is_empty())
@@ -1105,7 +1571,6 @@ fn char_to_byte_index(text: &str, character_index: usize) -> usize {
 fn fallback_theme() -> Theme {
     Theme {
         name: "fallback".to_string(),
-
         colors: ThemeColors {
             background: "#000000".to_string(),
             background_alt: "#000000".to_string(),
@@ -1134,7 +1599,6 @@ fn fallback_theme() -> Theme {
             bright_magenta: "#FF00FF".to_string(),
             bright_white: "#FFFFFF".to_string(),
         },
-
         usage: ThemeUsage {
             background: "background".to_string(),
             foreground: "foreground".to_string(),
@@ -1156,3 +1620,8 @@ fn fallback_theme() -> Theme {
         },
     }
 }
+
+// TODO: Add alternate compact Graphite ASCII/logo assets once the responsive
+// layout reaches the minimum useful size for the current block-art logo.
+// TODO: Add model-role messages (Graphite/User) once model output is wired in.
+// TODO: Add a dedicated responsive input editor if multiline user input is desired.
