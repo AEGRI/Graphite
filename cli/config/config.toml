@@ -1,3 +1,7 @@
 [color-scheme]
 directory = "themes"
 name = "tokyo-night"
+
+[model]
+name = "graphite-0.1"
+directory = "models"
