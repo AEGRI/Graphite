@@ -1,24 +1,12 @@
 use std::{
     fs,
-    io::{
-        self,
-        BufRead,
-        BufReader,
-        BufWriter,
-        Write,
-    },
+    io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    process::{
-        Child,
-        ChildStdin,
-        ChildStdout,
-        Command,
-        Stdio,
-    },
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -107,25 +95,18 @@ impl Model {
         if !tokenizer.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!(
-                    "tokenizer does not exist: '{}'",
-                    tokenizer.display()
-                ),
+                format!("tokenizer does not exist: '{}'", tokenizer.display()),
             ));
         }
 
         if !bridge.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!(
-                    "inference bridge does not exist: '{}'",
-                    bridge.display()
-                ),
+                format!("inference bridge does not exist: '{}'", bridge.display()),
             ));
         }
 
-        let python = std::env::var("GRAPHITE_PYTHON")
-            .unwrap_or_else(|_| "python".to_string());
+        let python = std::env::var("GRAPHITE_PYTHON").unwrap_or_else(|_| "python".to_string());
 
         let mut process = Command::new(&python)
             .arg(&bridge)
@@ -184,16 +165,10 @@ impl Model {
             "prompt": prompt,
         });
 
-        serde_json::to_writer(
-            &mut self.stdin,
-            &request,
-        )
-        .map_err(|error| {
+        serde_json::to_writer(&mut self.stdin, &request).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::Other,
-                format!(
-                    "could not send request to Graphite inference bridge: {error}"
-                ),
+                format!("could not send request to Graphite inference bridge: {error}"),
             )
         })?;
 
@@ -202,38 +177,28 @@ impl Model {
 
         let mut response_line = String::new();
 
-        let bytes_read = self
-            .stdout
-            .read_line(&mut response_line)?;
+        let bytes_read = self.stdout.read_line(&mut response_line)?;
 
         if bytes_read == 0 {
-            let status = self.process.try_wait()?.map(|status| {
-                status.to_string()
-            });
+            let status = self.process.try_wait()?.map(|status| status.to_string());
 
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 match status {
-                    Some(status) => format!(
-                        "Graphite inference bridge exited unexpectedly: {status}"
-                    ),
-                    None => {
-                        "Graphite inference bridge closed its output unexpectedly"
-                            .to_string()
+                    Some(status) => {
+                        format!("Graphite inference bridge exited unexpectedly: {status}")
                     }
+                    None => "Graphite inference bridge closed its output unexpectedly".to_string(),
                 },
             ));
         }
 
-        let response: Value =
-            serde_json::from_str(&response_line).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid response from Graphite inference bridge: {error}"
-                    ),
-                )
-            })?;
+        let response: Value = serde_json::from_str(&response_line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid response from Graphite inference bridge: {error}"),
+            )
+        })?;
 
         if let Some(error) = response.get("error") {
             return Err(io::Error::new(

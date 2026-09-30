@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{self, stdout, Write},
+    io::{self, Write, stdout},
     path::{Path, PathBuf},
 };
 
@@ -11,15 +11,15 @@ use crossterm::{
         KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Terminal,
 };
 use serde::Deserialize;
 
@@ -230,10 +230,7 @@ fn set_terminal_background(color: Color) -> io::Result<()> {
     };
 
     let mut stdout = stdout();
-    write!(
-        stdout,
-        "\x1b]11;rgb:{red:02x}/{green:02x}/{blue:02x}\x07"
-    )?;
+    write!(stdout, "\x1b]11;rgb:{red:02x}/{green:02x}/{blue:02x}\x07")?;
     stdout.flush()
 }
 
@@ -344,9 +341,7 @@ impl InputBox {
         Ok(terminal)
     }
 
-    pub fn stop(
-        mut terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> io::Result<()> {
+    pub fn stop(mut terminal: Terminal<CrosstermBackend<std::io::Stdout>>) -> io::Result<()> {
         disable_raw_mode()?;
         execute!(
             terminal.backend_mut(),
@@ -980,13 +975,10 @@ impl InputBox {
         let layouts = self.message_layouts(chat_area);
         let scroll = self.chat_scroll_offset(chat_area);
 
-        let absolute_row = row
-            .saturating_sub(chat_area.y)
-            .saturating_add(scroll);
+        let absolute_row = row.saturating_sub(chat_area.y).saturating_add(scroll);
 
         for layout in layouts {
-            if absolute_row < layout.top
-                || absolute_row >= layout.top.saturating_add(layout.height)
+            if absolute_row < layout.top || absolute_row >= layout.top.saturating_add(layout.height)
             {
                 continue;
             }
@@ -1003,9 +995,7 @@ impl InputBox {
                 let line = wrapped.get(relative_row as usize - 1)?;
 
                 let relative_column = if layout.right_aligned {
-                    let right_edge = layout
-                        .x
-                        .saturating_add(line.text.chars().count() as u16);
+                    let right_edge = layout.x.saturating_add(line.text.chars().count() as u16);
 
                     if column >= right_edge {
                         line.text.chars().count()
@@ -1036,13 +1026,7 @@ impl InputBox {
         None
     }
 
-    fn begin_mouse_selection(
-        &mut self,
-        column: u16,
-        row: u16,
-        chat_area: Rect,
-        input_area: Rect,
-    ) {
+    fn begin_mouse_selection(&mut self, column: u16, row: u16, chat_area: Rect, input_area: Rect) {
         if row >= input_area.y && row < input_area.y.saturating_add(input_area.height) {
             let position = self.input_index_from_mouse(column, row, input_area);
             self.cursor = position;
@@ -1056,8 +1040,7 @@ impl InputBox {
         if let Some((message_index, position)) =
             self.history_index_from_mouse(column, row, chat_area)
         {
-            self.history_selection =
-                Some((message_index, Selection::new(position, position)));
+            self.history_selection = Some((message_index, Selection::new(position, position)));
             self.input_selection_anchor = None;
             self.mouse_selection = Some(MouseSelection::History {
                 message_index,
@@ -1067,13 +1050,7 @@ impl InputBox {
         }
     }
 
-    fn update_mouse_selection(
-        &mut self,
-        column: u16,
-        row: u16,
-        chat_area: Rect,
-        input_area: Rect,
-    ) {
+    fn update_mouse_selection(&mut self, column: u16, row: u16, chat_area: Rect, input_area: Rect) {
         let Some(selection) = self.mouse_selection else {
             return;
         };
@@ -1128,12 +1105,7 @@ impl InputBox {
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Left), logo_area);
     }
 
-    fn draw_message(
-        &self,
-        frame: &mut ratatui::Frame,
-        chat_area: Rect,
-        layout: MessageLayout,
-    ) {
+    fn draw_message(&self, frame: &mut ratatui::Frame, chat_area: Rect, layout: MessageLayout) {
         let message = match self.messages.get(layout.message_index) {
             Some(message) => message,
             None => return,
@@ -1181,9 +1153,7 @@ impl InputBox {
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     "You",
-                    Style::default()
-                        .fg(you_color)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(you_color).add_modifier(Modifier::BOLD),
                 ))
                 .alignment(if layout.right_aligned {
                     Alignment::Right
@@ -1202,9 +1172,7 @@ impl InputBox {
         // Render only the message rows that actually intersect the chat area.
         // This is the important clipping step: even when a message is scrolled
         // upward, its lines cannot be painted into the header.
-        let text_start_row = visible_top
-            .saturating_sub(message_y)
-            .saturating_sub(1) as usize;
+        let text_start_row = visible_top.saturating_sub(message_y).saturating_sub(1) as usize;
         let text_end_row = visible_bottom
             .saturating_sub(message_y)
             .saturating_sub(1)
@@ -1226,12 +1194,8 @@ impl InputBox {
                         let mut style = Style::default().fg(text_color);
 
                         if let Some(selection) = selection {
-                            if absolute_index >= selection.start
-                                && absolute_index < selection.end
-                            {
-                                style = style
-                                    .fg(selection_foreground)
-                                    .bg(selection_background);
+                            if absolute_index >= selection.start && absolute_index < selection.end {
+                                style = style.fg(selection_foreground).bg(selection_background);
                             }
                         }
 
@@ -1380,12 +1344,20 @@ impl InputBox {
                 .x
                 .saturating_add(3)
                 .saturating_add(cursor_column as u16)
-                .min(input_area.x.saturating_add(input_area.width.saturating_sub(1)));
+                .min(
+                    input_area
+                        .x
+                        .saturating_add(input_area.width.saturating_sub(1)),
+                );
             let cursor_y = input_area
                 .y
                 .saturating_add(1)
                 .saturating_add(cursor_visible_line as u16)
-                .min(input_area.y.saturating_add(input_area.height.saturating_sub(1)));
+                .min(
+                    input_area
+                        .y
+                        .saturating_add(input_area.height.saturating_sub(1)),
+                );
 
             frame.set_cursor_position((cursor_x, cursor_y));
         })?;
@@ -1482,9 +1454,7 @@ impl InputBox {
                             self.delete();
                         }
 
-                        KeyCode::Char(character)
-                            if !modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
                             self.insert_character(character);
                         }
 
