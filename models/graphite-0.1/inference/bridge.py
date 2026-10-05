@@ -36,16 +36,21 @@ class GraphiteBridge:
 
     def __init__(self):
         self.config = self.load_inference_config()
+
         self.tokenizer = GraphiteTokenizer.load(
             TOKENIZER_PATH
         )
+
         self.runtime = self.load_runtime(
             self.config
         )
 
         self.generation_config = self.config.get(
             "generation",
-            self.config.get("inference", {}),
+            self.config.get(
+                "inference",
+                {},
+            ),
         )
 
     @staticmethod
@@ -192,8 +197,14 @@ class GraphiteBridge:
             .tolist()
         )
 
+        # generate() returns the original prompt followed by
+        # newly generated tokens. Only return the new tokens.
+        response_ids = generated_ids[
+            len(input_ids):
+        ]
+
         return self.tokenizer.decode(
-            generated_ids,
+            response_ids,
             skip_special_tokens=True,
         )
 
@@ -263,6 +274,7 @@ class GraphiteBridge:
 def main() -> int:
     try:
         bridge = GraphiteBridge()
+
         return bridge.run()
 
     except Exception as error:

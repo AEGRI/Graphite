@@ -1,6 +1,6 @@
 {
   "model": {
-    "checkpoint": "checkpoints/graphite-0.1.pt"
+    "checkpoint": "training/runs/graphite-run-42-step-500.ckpt"
   },
   "inference": {
     "max_new_tokens": 256,
