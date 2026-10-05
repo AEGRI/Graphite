@@ -272,7 +272,6 @@ struct MessageLayout {
     height: u16,
     width: u16,
     x: u16,
-    text_top: u16,
     text_lines: usize,
     separator_width: u16,
     right_aligned: bool,
@@ -800,7 +799,6 @@ impl InputBox {
                 height,
                 width,
                 x,
-                text_top: top + 1,
                 text_lines,
                 separator_width,
                 right_aligned,
@@ -855,19 +853,6 @@ impl InputBox {
         } else {
             self.follow_bottom = false;
         }
-        self.dirty = true;
-    }
-
-    fn scroll_to_top(&mut self, chat_area: Rect) {
-        let max_scroll = self.max_chat_scroll(chat_area);
-        self.chat_scroll = max_scroll;
-        self.follow_bottom = false;
-        self.dirty = true;
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        self.chat_scroll = 0;
-        self.follow_bottom = true;
         self.dirty = true;
     }
 
@@ -1315,9 +1300,6 @@ impl InputBox {
                             self.scroll_up(2, layout[1]);
                         }
                         KeyCode::PageDown => {
-                            let size = terminal.size()?;
-                            let area = Rect::new(0, 0, size.width, size.height);
-                            let layout = self.terminal_layout(area);
                             self.scroll_down(2);
                         }
                         KeyCode::Up => {
