@@ -1,4 +1,7 @@
 {
+  "model": {
+    "checkpoint": "checkpoints/graphite-0.1.pt"
+  },
   "inference": {
     "max_new_tokens": 256,
     "temperature": 0.8,
