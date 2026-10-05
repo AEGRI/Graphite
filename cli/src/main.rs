@@ -30,10 +30,10 @@ fn run() -> io::Result<()> {
 
                 match model.generate(text) {
                     Ok(response) => {
-                        input.add_message(&response);
+                        input.add_graphite_message(&response);
                     }
                     Err(error) => {
-                        input.add_message(&format!("Graphite error: {error}"));
+                        input.add_graphite_message(&format!("Graphite error: {error}"));
                     }
                 }
             }
