@@ -19,22 +19,11 @@ from tokenizer.tokenizer import GraphiteTokenizer
 
 MODEL_CONFIG_PATH = MODEL_ROOT / "config" / "model.json"
 INFERENCE_CONFIG_PATH = MODEL_ROOT / "config" / "inference.json"
-TOKENIZER_PATH = (
-    MODEL_ROOT
-    / "tokenizer"
-    / "files"
-    / "tokenizer.json"
-)
+TOKENIZER_PATH = MODEL_ROOT / "tokenizer" / "files" / "tokenizer.json"
 
 
 class GraphiteBridge:
-    """
-    Persistent inference bridge for Graphite.
-
-    Loads the tokenizer and model once, then processes JSON requests
-    through stdin/stdout. Diagnostic output goes to stderr so stdout
-    remains compatible with the Rust CLI.
-    """
+    """Persistent JSON-lines inference bridge for Graphite."""
 
     def __init__(self):
         self.config = self.load_inference_config()
@@ -53,20 +42,19 @@ class GraphiteBridge:
 
     @staticmethod
     def resolve_checkpoint(config: dict[str, Any]) -> Path:
-        model_config = config.get("model", {})
-        checkpoint = model_config.get("checkpoint")
+        # An environment override must take precedence over the config.
+        checkpoint = os.environ.get("GRAPHITE_CHECKPOINT")
 
-        if checkpoint is None:
+        if not checkpoint:
+            checkpoint = config.get("model", {}).get("checkpoint")
+
+        if not checkpoint:
             checkpoint = config.get("checkpoint")
-
-        if checkpoint is None:
-            checkpoint = os.environ.get("GRAPHITE_CHECKPOINT")
 
         if not checkpoint:
             raise RuntimeError(
-                "No Graphite checkpoint is configured. "
-                "Set model.checkpoint in inference.json "
-                "or GRAPHITE_CHECKPOINT in the environment."
+                "No checkpoint configured. Set model.checkpoint "
+                "in inference.json or GRAPHITE_CHECKPOINT."
             )
 
         checkpoint_path = Path(checkpoint)
@@ -76,7 +64,7 @@ class GraphiteBridge:
 
         checkpoint_path = checkpoint_path.resolve()
 
-        if not checkpoint_path.exists():
+        if not checkpoint_path.is_file():
             raise FileNotFoundError(
                 f"Graphite checkpoint does not exist: {checkpoint_path}"
             )
@@ -85,12 +73,19 @@ class GraphiteBridge:
 
     @classmethod
     def load_runtime(cls, config: dict[str, Any]) -> GraphiteRuntime:
+        checkpoint_path = cls.resolve_checkpoint(config)
+
+        print(
+            f"[Graphite] Loading checkpoint: {checkpoint_path}",
+            file=sys.stderr,
+            flush=True,
+        )
+
         runtime = GraphiteRuntime.from_config(
             MODEL_CONFIG_PATH,
             INFERENCE_CONFIG_PATH,
         )
-
-        runtime.load_checkpoint(cls.resolve_checkpoint(config))
+        runtime.load_checkpoint(checkpoint_path)
         return runtime
 
     def generate_text(self, prompt: str) -> str:
@@ -111,12 +106,10 @@ class GraphiteBridge:
             device=self.runtime.device,
         )
 
-        generated_ids = generate(
+        generated = generate(
             runtime=self.runtime,
             input_ids=input_tensor,
-            max_new_tokens=self.generation_config.get(
-                "max_new_tokens", 256
-            ),
+            max_new_tokens=self.generation_config.get("max_new_tokens", 256),
             temperature=self.generation_config.get("temperature", 0.8),
             top_k=self.generation_config.get("top_k", 50),
             top_p=self.generation_config.get("top_p", 0.95),
@@ -124,19 +117,21 @@ class GraphiteBridge:
             seed=self.generation_config.get("seed"),
         )
 
-        all_token_ids = generated_ids[0].detach().cpu().tolist()
+        all_ids = generated[0].detach().cpu().tolist()
+        response_ids = all_ids[len(input_ids):]
 
-        # generate() returns the prompt followed by newly generated tokens.
-        response_ids = all_token_ids[len(input_ids):]
+        # Keep terminal diagnostics short.
+        preview_count = 32
+        preview = response_ids[:preview_count]
+        suffix = " ..." if len(response_ids) > preview_count else ""
 
-        # Show the model's actual generated token IDs in the terminal.
         print(
-            f"[Graphite raw token IDs] {response_ids}",
+            f"[Graphite] Generated {len(response_ids)} tokens: "
+            f"{preview}{suffix}",
             file=sys.stderr,
             flush=True,
         )
 
-        # Decode if possible; preserve raw IDs if decoding fails.
         try:
             return self.tokenizer.decode(
                 response_ids,
@@ -144,21 +139,20 @@ class GraphiteBridge:
             )
         except (ValueError, KeyError) as error:
             print(
-                f"[Graphite decode error] {error}",
+                f"[Graphite] Decoding failed: {error}",
                 file=sys.stderr,
                 flush=True,
             )
             return (
-                "[Tokenizer could not decode the model output]\n"
-                f"Raw token IDs: {response_ids}"
+                f"[Raw token output: {len(response_ids)} tokens; "
+                f"first {len(preview)} IDs: {preview}{suffix}]"
             )
 
     def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(request, dict):
             raise ValueError("request must be a JSON object.")
 
-        prompt = request.get("prompt")
-        return {"text": self.generate_text(prompt)}
+        return {"text": self.generate_text(request.get("prompt"))}
 
     def run(self) -> int:
         for line in sys.stdin:
@@ -170,17 +164,10 @@ class GraphiteBridge:
             try:
                 request = json.loads(line)
                 response = self.handle_request(request)
-
-                print(
-                    json.dumps(response, ensure_ascii=False),
-                    flush=True,
-                )
+                print(json.dumps(response, ensure_ascii=False), flush=True)
             except Exception as error:
                 print(
-                    json.dumps(
-                        {"error": str(error)},
-                        ensure_ascii=False,
-                    ),
+                    json.dumps({"error": str(error)}, ensure_ascii=False),
                     flush=True,
                 )
 
@@ -189,8 +176,7 @@ class GraphiteBridge:
 
 def main() -> int:
     try:
-        bridge = GraphiteBridge()
-        return bridge.run()
+        return GraphiteBridge().run()
     except Exception as error:
         print(
             json.dumps({"error": str(error)}, ensure_ascii=False),
