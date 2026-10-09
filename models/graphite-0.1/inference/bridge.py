@@ -1,4 +1,3 @@
-
 import json
 import os
 import sys
@@ -34,6 +33,22 @@ class GraphiteBridge:
             self.config.get("inference", {}),
         )
 
+        self.eos_token_id = self.tokenizer.special_tokens.get("<eos>")
+
+        print(
+            f"[Graphite] Tokenizer vocabulary: {self.tokenizer.vocab_size}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        if self.eos_token_id is None:
+            print(
+                "[Graphite] Warning: tokenizer has no <eos> token; "
+                "generation will stop at the token limit.",
+                file=sys.stderr,
+                flush=True,
+            )
+
     @staticmethod
     def load_inference_config() -> dict[str, Any]:
         return json.loads(
@@ -42,14 +57,15 @@ class GraphiteBridge:
 
     @staticmethod
     def resolve_checkpoint(config: dict[str, Any]) -> Path:
-        # An environment override must take precedence over the config.
-        checkpoint = os.environ.get("GRAPHITE_CHECKPOINT")
+        """Resolve the explicit checkpoint override or configured checkpoint."""
+
+        checkpoint = os.environ.get("GRAPHITE_CHECKPOINT", "").strip()
 
         if not checkpoint:
-            checkpoint = config.get("model", {}).get("checkpoint")
-
-        if not checkpoint:
-            checkpoint = config.get("checkpoint")
+            checkpoint = (
+                config.get("model", {}).get("checkpoint")
+                or config.get("checkpoint")
+            )
 
         if not checkpoint:
             raise RuntimeError(
@@ -85,7 +101,16 @@ class GraphiteBridge:
             MODEL_CONFIG_PATH,
             INFERENCE_CONFIG_PATH,
         )
-        runtime.load_checkpoint(checkpoint_path)
+
+        checkpoint_info = runtime.load_checkpoint(checkpoint_path)
+
+        print(
+            f"[Graphite] Checkpoint loaded "
+            f"(step={checkpoint_info.get('step', 0)}).",
+            file=sys.stderr,
+            flush=True,
+        )
+
         return runtime
 
     def generate_text(self, prompt: str) -> str:
@@ -109,18 +134,22 @@ class GraphiteBridge:
         generated = generate(
             runtime=self.runtime,
             input_ids=input_tensor,
-            max_new_tokens=self.generation_config.get("max_new_tokens", 256),
-            temperature=self.generation_config.get("temperature", 0.8),
+            max_new_tokens=self.generation_config.get(
+                "max_new_tokens", 256
+            ),
+            temperature=self.generation_config.get(
+                "temperature", 0.8
+            ),
             top_k=self.generation_config.get("top_k", 50),
             top_p=self.generation_config.get("top_p", 0.95),
             do_sample=self.generation_config.get("do_sample", True),
             seed=self.generation_config.get("seed"),
+            eos_token_id=self.eos_token_id,
         )
 
         all_ids = generated[0].detach().cpu().tolist()
         response_ids = all_ids[len(input_ids):]
 
-        # Keep terminal diagnostics short.
         preview_count = 32
         preview = response_ids[:preview_count]
         suffix = " ..." if len(response_ids) > preview_count else ""
@@ -143,6 +172,7 @@ class GraphiteBridge:
                 file=sys.stderr,
                 flush=True,
             )
+
             return (
                 f"[Raw token output: {len(response_ids)} tokens; "
                 f"first {len(preview)} IDs: {preview}{suffix}]"
@@ -152,9 +182,13 @@ class GraphiteBridge:
         if not isinstance(request, dict):
             raise ValueError("request must be a JSON object.")
 
-        return {"text": self.generate_text(request.get("prompt"))}
+        return {
+            "text": self.generate_text(request.get("prompt"))
+        }
 
     def run(self) -> int:
+        """Read one JSON request per line and emit one JSON response per line."""
+
         for line in sys.stdin:
             line = line.strip()
 
@@ -164,10 +198,18 @@ class GraphiteBridge:
             try:
                 request = json.loads(line)
                 response = self.handle_request(request)
-                print(json.dumps(response, ensure_ascii=False), flush=True)
+
+                print(
+                    json.dumps(response, ensure_ascii=False),
+                    flush=True,
+                )
+
             except Exception as error:
                 print(
-                    json.dumps({"error": str(error)}, ensure_ascii=False),
+                    json.dumps(
+                        {"error": str(error)},
+                        ensure_ascii=False,
+                    ),
                     flush=True,
                 )
 
@@ -177,9 +219,13 @@ class GraphiteBridge:
 def main() -> int:
     try:
         return GraphiteBridge().run()
+
     except Exception as error:
         print(
-            json.dumps({"error": str(error)}, ensure_ascii=False),
+            json.dumps(
+                {"error": str(error)},
+                ensure_ascii=False,
+            ),
             flush=True,
         )
         return 1
