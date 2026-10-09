@@ -8,49 +8,36 @@ def sample_next_token(
     temperature: float = 1.0,
     top_k: int = 0,
     top_p: float = 1.0,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """
-    Sample the next token from model logits.
-    """
+    """Sample the next token using temperature, top-k, and top-p."""
 
     if temperature <= 0:
-        raise ValueError(
-            "temperature must be greater than 0."
-        )
+        raise ValueError("temperature must be greater than 0.")
+
+    if top_k < 0:
+        raise ValueError("top_k must be non-negative.")
+
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("top_p must be greater than 0 and at most 1.")
 
     logits = logits / temperature
 
     if top_k > 0:
-        top_k = min(
-            top_k,
-            logits.size(-1),
-        )
-
-        values, _ = torch.topk(
-            logits,
-            top_k,
-        )
-
+        k = min(top_k, logits.size(-1))
+        values, _ = torch.topk(logits, k, dim=-1)
         threshold = values[..., -1, None]
 
-        logits = torch.where(
+        logits = logits.masked_fill(
             logits < threshold,
-            torch.full_like(
-                logits,
-                torch.finfo(logits.dtype).min,
-            ),
-            logits,
+            torch.finfo(logits.dtype).min,
         )
 
     if top_p < 1.0:
-        if not 0.0 < top_p <= 1.0:
-            raise ValueError(
-                "top_p must be between 0 and 1."
-            )
-
         sorted_logits, sorted_indices = torch.sort(
             logits,
             descending=True,
+            dim=-1,
         )
 
         sorted_probabilities = torch.softmax(
@@ -58,22 +45,15 @@ def sample_next_token(
             dim=-1,
         )
 
-        cumulative_probabilities = (
-            torch.cumsum(
-                sorted_probabilities,
-                dim=-1,
-            )
+        cumulative_probabilities = torch.cumsum(
+            sorted_probabilities,
+            dim=-1,
         )
 
-        remove_tokens = (
-            cumulative_probabilities
-            > top_p
-        )
+        remove_tokens = cumulative_probabilities > top_p
 
-        remove_tokens[..., 1:] = (
-            remove_tokens[..., :-1].clone()
-        )
-
+        # Keep the first token that crosses the threshold.
+        remove_tokens[..., 1:] = remove_tokens[..., :-1].clone()
         remove_tokens[..., 0] = False
 
         sorted_logits = sorted_logits.masked_fill(
@@ -92,14 +72,12 @@ def sample_next_token(
             sorted_logits,
         )
 
-    probabilities = torch.softmax(
-        logits,
-        dim=-1,
-    )
+    probabilities = torch.softmax(logits, dim=-1)
 
     return torch.multinomial(
         probabilities,
         num_samples=1,
+        generator=generator,
     )
 
 
@@ -115,48 +93,60 @@ def generate(
     seed: int | None = None,
 ) -> torch.Tensor:
     """
-    Generate new token IDs autoregressively.
+    Generate token IDs autoregressively.
+
+    Returns the original input IDs followed by generated IDs.
+    Generation stops when all batch sequences emit EOS or the token
+    limit is reached.
     """
 
     if max_new_tokens < 0:
-        raise ValueError(
-            "max_new_tokens must be non-negative."
-        )
+        raise ValueError("max_new_tokens must be non-negative.")
 
     if input_ids.dim() != 2:
         raise ValueError(
             "input_ids must have shape [batch, sequence]."
         )
 
+    if input_ids.size(1) == 0:
+        raise ValueError("input_ids cannot have an empty sequence.")
+
+    if do_sample and temperature <= 0:
+        raise ValueError("temperature must be greater than 0.")
+
+    context_length = runtime.model.context_length
+
+    if context_length <= 0:
+        raise ValueError("model context_length must be positive.")
+
+    # Use a local generator so seeded generation is reproducible
+    # without resetting PyTorch's global random state.
+    generator = None
+
     if seed is not None:
-        generator = torch.Generator(
-            device=runtime.device
-        )
-
+        generator = torch.Generator(device=runtime.device)
         generator.manual_seed(seed)
-    else:
-        generator = None
 
-    generated_ids = input_ids.to(
-        runtime.device
-    )
+    generated_ids = input_ids.to(runtime.device)
 
-    context_length = (
-        runtime.model.context_length
+    # Read EOS from the loaded runtime tokenizer when available.
+    tokenizer = getattr(runtime, "tokenizer", None)
+    if tokenizer is None:
+        tokenizer = getattr(runtime, "tokenizer_instance", None)
+
+    special_tokens = getattr(tokenizer, "special_tokens", {})
+    eos_token_id = special_tokens.get("<eos>")
+
+    finished = torch.zeros(
+        generated_ids.size(0),
+        dtype=torch.bool,
+        device=runtime.device,
     )
 
     for _ in range(max_new_tokens):
-        model_input = generated_ids[
-            :, -context_length:
-        ]
-
-        logits = runtime.forward(
-            model_input
-        )
-
-        next_token_logits = logits[
-            :, -1, :
-        ]
+        model_input = generated_ids[:, -context_length:]
+        logits = runtime.forward(model_input)
+        next_token_logits = logits[:, -1, :]
 
         if do_sample:
             next_token = sample_next_token(
@@ -164,20 +154,8 @@ def generate(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                generator=generator,
             )
-
-            if generator is not None:
-                probabilities = torch.softmax(
-                    next_token_logits / temperature,
-                    dim=-1,
-                )
-
-                next_token = torch.multinomial(
-                    probabilities,
-                    num_samples=1,
-                    generator=generator,
-                )
-
         else:
             next_token = torch.argmax(
                 next_token_logits,
@@ -185,12 +163,24 @@ def generate(
                 keepdim=True,
             )
 
-        generated_ids = torch.cat(
-            [
-                generated_ids,
+        if eos_token_id is not None:
+            # Preserve completed sequences while the remaining batch
+            # continues generating.
+            next_token = torch.where(
+                finished.unsqueeze(-1),
+                torch.full_like(next_token, eos_token_id),
                 next_token,
-            ],
+            )
+
+        generated_ids = torch.cat(
+            [generated_ids, next_token],
             dim=-1,
         )
+
+        if eos_token_id is not None:
+            finished |= next_token.squeeze(-1).eq(eos_token_id)
+
+            if finished.all():
+                break
 
     return generated_ids
